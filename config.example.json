@@ -1,0 +1,10 @@
+{
+  "leapScale": 0.001,
+  "leapAnchorX": 0,
+  "leapAnchorY": 1.0,
+  "leapAnchorZ": 0.2,
+  "leapForearmRoll": 0.5,
+  "leapElbowDown": 0.2,
+  "leapShoulderGain": 0.4,
+  "bgTransparent": true
+}

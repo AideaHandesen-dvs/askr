@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+renderer/.venv/
+renderer/config.json
+renderer/assets/*.vrm
+*.bak*
+leap_capture.txt

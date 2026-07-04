@@ -1,0 +1,1180 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Askr — VTuber renderer (three-vrm)</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #12141a; }
+  #status {
+    position: fixed; top: 8px; left: 8px; z-index: 10;
+    font: 12px/1.4 monospace; color: #9fb; background: rgba(0,0,0,.55);
+    padding: 6px 9px; border-radius: 6px; white-space: pre-wrap; max-width: 62ch;
+  }
+  #settings {
+    position: fixed; top: 8px; right: 8px; z-index: 10;
+    font: 12px/1.5 monospace; color: #cde; background: rgba(0,0,0,.62);
+    padding: 8px 10px; border-radius: 6px; min-width: 200px;
+    max-height: calc(100vh - 16px); overflow-y: auto; overflow-x: hidden;
+  }
+  /* パネルが縦に伸びてもスクロールで全項目に届く。スクロールバーは控えめに */
+  #settings::-webkit-scrollbar { width: 8px; }
+  #settings::-webkit-scrollbar-thumb { background: #3a4658; border-radius: 4px; }
+  #settings::-webkit-scrollbar-track { background: transparent; }
+  #settings .ttl { color: #9fb; font-weight: bold; margin-bottom: 5px; }
+  #settings .sep { color: #9fb; font-weight: bold; margin: 8px 0 3px; padding-top: 5px;
+    border-top: 1px solid #3a4658; font-size: 11px; }
+  #settings .row { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+  #settings .row input[type=color] { flex: 1; height: 20px; padding: 0; border: 1px solid #4a5568;
+    background: #2a3242; cursor: pointer; }
+  #settings .row label { flex: 0 0 66px; }
+  #settings .row input[type=range] { flex: 1; min-width: 54px; }
+  #settings .row .val { flex: 0 0 46px; text-align: right; color: #9fb; }
+  #settings button { background: #2a3242; color: #cde; border: 1px solid #4a5568;
+    border-radius: 4px; padding: 1px 8px; cursor: pointer; font: inherit; }
+  #settings button:hover { background: #3a4658; }
+  #settings .reset { margin-top: 6px; width: 100%; }
+  canvas { display: block; }   /* 鏡はデータ側(CFG.mirror)で行う。CSS画像反転だとメッシュ(アホ毛等の非対称)まで反転してしまうため */
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.169.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.169.0/examples/jsm/",
+    "@pixiv/three-vrm": "https://unpkg.com/@pixiv/three-vrm@3.4.0/lib/three-vrm.module.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="status">booting…</div>
+<div id="settings"></div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { VRMLoaderPlugin, VRMUtils,
+         VRMSpringBoneCollider, VRMSpringBoneColliderShapeCapsule,
+         VRMExpression, VRMExpressionMorphTargetBind } from '@pixiv/three-vrm';
+// 注: collider group はクラスではなく型（プレーンな {colliders:[...]} ）。import不可
+
+// ==== 調整パラメータ ====
+const BODY_TILT_GAIN = 0;    // iFMに上体/肩の位置データが無い(顔トラッカー)ため無効。体はLeapから取る
+// 不感帯は CFG.bodyDeadzone に移動(パネル調整可)。これ未満の微動(ノイズ)は無視＝静止時グラグラ防止
+
+// 首(喉)位置の推定: neck = head_pos − R_head·anchor（頭を傾けても不変な点）。
+// anchor = 首ピボット→頭アンカーの固定オフセット(iFM生空間)。up主体、要実機調整。
+// 検証: 黄色ドットをneckに向け、頭を傾げて「動かない」ことを確認する。
+const NECK_ANCHOR = new THREE.Vector3(0, 0.10, 0.0);   // 起動時に CFG.neckAnchor(保存済みキャリブ)で上書きされる
+
+// ==== 上半身駆動（首信号→hips平行移動＋足ピンIK）調整パラメータ ====
+// 首の並進を hips に流し、足首を床にピン留め(2ボーンIK)＝つま先固定で踏ん張るバランス。
+const GAIN_LAT = 0.5, GAIN_VERT = 0.6, GAIN_DEPTH = 0.0;  // 左右/上下/前後(前後は今回オフ)
+const LAT_MAX = 0.05, VERT_MAX = 0.07, DEPTH_MAX = 0.04;  // hips移動量の上限[m]
+const STRAIGHT_MARGIN = 0.02;    // 伸びきり2cm手前で止める(膝ポップ回避)
+const TURN_GAIN = 0.3, TURN_MAX = 0.2;  // 頭傾げ(roll)→胴ヨー[rad]。傾げた方向へ体をわずかに向ける
+// 各軸の符号・体駆動ON/OFF・全体倍率・胴collider半径は CFG(signX/signY/signT/bodyDrive/ikEnabled/gainMul/colliderR)へ集約
+// gaze(目線): ブリッジが眼球回転 leftEye#/rightEye#(実測 上下±15°/左右±6°) を素で送るようになった。
+//   増幅は不要なので基本は素通し(gain=1,bias=0)。眼球オイラーの軸/符号がズレてたとき用に
+//   g/G=pitchゲイン, j/J=中心(bias), k=上下反転 を残す(実機で1回合わせるだけ)。
+// ==== 設定(localStorageに保存・右上パネルで調整) ====
+//   目線ゲインは眼球±15°→白目回避で圧縮。実機で合わせた値はブラウザに残りリロードで復活する。
+const CFG_DEFAULTS = {
+  eyePitchGain: 0.2, eyeYawGain: 0.4, eyePitchSign: 1, eyeYawSign: 1,
+  smileClip: 'fun', smileMouth: false, smileWidth: 1.3, smileGain: 1.0, mouthGain: 1.3, mouthThresh: 0.2,
+  // 体駆動(旧キー操作を設定化)：うっかりキー押下で変わらないよう全部パネル/保存に集約
+  mirror: true,   // 左右ミラー(鏡モード)。データ側で動きだけ鏡映＝メッシュ(アホ毛/非対称)は反転しない
+  bodyDrive: true, ikEnabled: true, gainMul: 1.0, signX: 1, signY: 1, signT: -1, colliderR: 0.09,
+  bodyDeadzone: 0.01,   // 首信号の不感帯[m]。大きいと中央付近の小さい上下/左右が殺される(旧固定0.025→揺れない主因)
+
+  neckAnchor: [0, 0.10, 0.0],   // 首(喉)アンカー。キャリブ結果を保存＝リロードでも首ドットが不変点に留まる
+
+  // 背景：透過ONでOBSブラウザソースの背景抜き(αチャンネル)。OFFなら bgColor で塗る(グリーンバック等)
+  bgTransparent: false, bgColor: '#12141a',
+
+  // ==== Leap(手/指) ====  ※P1=生ジョイントをデバッグ球で可視化し座標変換を実測で合わせる段階
+  //   Leap空間(mm・X右/Y上/Z手前=ユーザ向き) → 表示空間 は three=anchor+scale*sign*leap で仮変換。
+  //   実データを見ながら sign/anchor/scale を詰めてからボーン駆動(P2)へ進む。
+  leapDebug: true,                 // デバッグ球の表示(手の生ジョイント)
+  leapScale: 0.001,                // mm→m
+  leapSignX: 1, leapSignY: 1, leapSignZ: -1,   // 各軸の向き(実測で確定)
+  leapAnchorX: 0.0, leapAnchorY: 1.0, leapAnchorZ: 0.2,  // Leap原点を表示空間のどこへ置くか[m]
+  leapFingers: true,               // 指ボーンのリターゲット(P2)。Leap関節方向へ各指を aim
+  leapSmooth: 0.5,                 // 指の平滑(0=生/1=即時。低いほどヌルヌルだが遅延)
+  leapHandSwap: false,             // 手の左右割当を入替(mirror込みで自動判定、合わなければON)
+  leapArms: true,                  // 腕を手首位置へ2ボーンIK(P3)。手が前に出て指が見える
+  leapArmSmooth: 0.35,             // 腕IKの目標位置EMA(0=生/1=即時。低いほど滑らかだが遅延)
+  leapElbowPole: true,             // 肘の曲げ方向をLeap実肘から決める(OFF=でっち上げpole)。演者の肘の曲がりを再現
+  leapElbowDown: 0,                // 肘を下げるバイアス。pole(曲げ方向)に下向き成分を足す。上げるほど肘が落ちる
+  leapShoulder: true,              // 肩(鎖骨)を手首へ連動＝手を上げると肩が上がる(挙上)。肘の張り出しも緩和
+  leapShoulderGain: 0.4,           // 肩の連動量(0=固定/1=手首方向へフル)。上げると肩がよく動く
+  leapRestPose: true,              // restを直立・腕下ろし姿勢へ(モデルのT/Aポーズをやめる)。肩の可動域が増え自然に
+  leapRestArmOut: 12,              // 下ろした腕の開き角[°](鉛直から)。小=体に沿う/大=ハの字に広がる
+  leapWrist: true,                 // 手首の向きをLeapから駆動(手のひら基底を位置から再構成＝反射に強い)
+  leapForearmRoll: 0.5,            // 回内/回外(ひねり)を前腕へ配分する割合。0=全部手首(グニャ)/1=全部前腕(肘ねじれ)。折半が無難
+
+  // カメラ(表示位置)。4スロットに現在の視点(位置/注視点)を焼く。キー1-4で呼出。起動時はスロット1を復元
+  camSlots: [null, null, null, null],
+};
+const CFG = { ...CFG_DEFAULTS };      // 起動時にサーバ(/config)から上書き＝どのPCから開いても同じ設定
+let refreshPanel = () => {};          // パネル構築後に実体が入る
+let _saveTimer = null;
+function saveCfg() {                   // 連続操作(スライダー等)をまとめて300ms後にPOST
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(() => {
+    fetch('/config', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                       body: JSON.stringify(CFG) }).catch(() => {});
+  }, 300);
+}
+async function loadCfg() {
+  try { const r = await fetch('/config'); if (r.ok) Object.assign(CFG, await r.json()); } catch {}
+  if (Array.isArray(CFG.neckAnchor)) NECK_ANCHOR.fromArray(CFG.neckAnchor);   // 保存済みキャリブを復元
+  if (typeof controls !== 'undefined') applyCamSlot(0);   // 起動時はスロット1の画角を復元
+  refreshPanel(); applySideEffects(); applyArmRestPose();
+}
+// CFG → 描画側へ即反映(背景・collider半径)。パネル変更/起動/設定読込後に呼ぶ。renderer生成後のみ呼ぶこと
+function applySideEffects() {
+  if (CFG.bgTransparent) {                                      // 透過＝OBSブラウザソースで背景抜き(αチャンネル)
+    renderer.setClearColor(0x000000, 0);
+    document.documentElement.style.background = 'transparent';
+    document.body.style.background = 'transparent';
+  } else {                                                      // 指定色で塗る(グリーンバッククロマキー等)
+    renderer.setClearColor(new THREE.Color(CFG.bgColor), 1);
+    document.documentElement.style.background = CFG.bgColor;
+    document.body.style.background = CFG.bgColor;
+  }
+  for (const s of bodyColliderShapes) s.radius = CFG.colliderR;
+}
+const bodyColliderShapes = [];   // 追加したカプセルshape(半径は CFG.colliderR でライブ調整)
+
+const statusEl = document.getElementById('status');
+let loadInfo = '';
+const setStatus = (extra) => { statusEl.textContent = loadInfo + (extra ? '\n' + extra : ''); };
+
+// ==== 設定パネル(右上)。キー操作とも同期し、変更はサーバへ保存 ====
+const settingsEl = document.getElementById('settings');
+const PANEL = [
+  { k: 'eyePitchGain', label: '目線 上下', type: 'range', min: 0, max: 1, step: 0.05 },
+  { k: 'eyeYawGain',   label: '目線 左右', type: 'range', min: 0, max: 1, step: 0.05 },
+  { k: 'eyePitchSign', label: '上下 向き', type: 'sign' },
+  { k: 'eyeYawSign',   label: '左右 向き', type: 'sign' },
+  { k: 'smileClip',    label: '笑顔',      type: 'choice', choices: ['fun', 'joy'] },
+  { k: 'smileWidth',   label: '口角 幅',   type: 'range', min: 0, max: 2, step: 0.1 },
+  { k: 'smileMouth',   label: '複合(旧)',  type: 'bool' },
+  { k: 'smileGain',    label: '笑顔 強さ', type: 'range', min: 0, max: 2, step: 0.1 },
+  { k: 'mouthGain',    label: '口 開き',   type: 'range', min: 0, max: 2.5, step: 0.1 },
+  { k: 'mouthThresh',  label: '開き閾値',  type: 'range', min: 0, max: 0.6, step: 0.02 },
+  { sep: '体・首' },
+  { k: 'mirror',       label: '左右ミラー', type: 'bool' },
+  { k: 'bodyDrive',    label: '体駆動',    type: 'bool' },
+  { k: 'ikEnabled',    label: '足IK',      type: 'bool' },
+  { k: 'gainMul',      label: '体 倍率',   type: 'range', min: 0, max: 3, step: 0.1 },
+  { k: 'bodyDeadzone', label: '不感帯',    type: 'range', min: 0, max: 0.05, step: 0.005 },
+  { k: 'signX',        label: '体左右 符号', type: 'sign' },
+  { k: 'signY',        label: '体上下 符号', type: 'sign' },
+  { k: 'signT',        label: '傾き 符号', type: 'sign' },
+  { k: 'colliderR',    label: '髪collider', type: 'range', min: 0, max: 0.2, step: 0.01 },
+  { type: 'action',    label: 'キャリブ',  btn: '開始/確定', run: () => toggleCalib() },
+  { type: 'action',    label: '基準',      btn: 'リセット',  run: () => { neckBase = null; rootBase = null; sigEMA = null; } },
+  { type: 'action',    label: '脚rest',    btn: '再取得',    run: () => { legRest = null; } },
+  { sep: 'Leap (手/指)' },
+  { k: 'leapDebug',    label: 'デバッグ球', type: 'bool' },
+  { k: 'leapScale',    label: 'スケール',  type: 'range', min: 0.0005, max: 0.003, step: 0.0001 },
+  { k: 'leapSignX',    label: '手X 符号',  type: 'sign' },
+  { k: 'leapSignY',    label: '手Y 符号',  type: 'sign' },
+  { k: 'leapSignZ',    label: '手Z 符号',  type: 'sign' },
+  { k: 'leapAnchorX',  label: '手 原点X',  type: 'range', min: -0.5, max: 0.5, step: 0.02 },
+  { k: 'leapAnchorY',  label: '手 原点Y',  type: 'range', min: 0.3, max: 1.6, step: 0.02 },
+  { k: 'leapAnchorZ',  label: '手 原点Z',  type: 'range', min: -0.5, max: 0.6, step: 0.02 },
+  { k: 'leapArms',     label: '腕IK',      type: 'bool' },
+  { k: 'leapArmSmooth', label: '腕 平滑',  type: 'range', min: 0, max: 1, step: 0.05 },
+  { k: 'leapElbowPole', label: '肘=実肘',  type: 'bool' },
+  { k: 'leapElbowDown', label: '肘 下げ',  type: 'range', min: 0, max: 0.6, step: 0.02 },
+  { k: 'leapShoulder', label: '肩 連動',   type: 'bool' },
+  { k: 'leapShoulderGain', label: '肩 連動量', type: 'range', min: 0, max: 1, step: 0.05 },
+  { k: 'leapRestPose', label: '腕下ろしrest', type: 'bool' },
+  { k: 'leapRestArmOut', label: '下ろし開き', type: 'range', min: 0, max: 45, step: 1 },
+  { k: 'leapWrist',    label: '手首 向き', type: 'bool' },
+  { k: 'leapForearmRoll', label: '前腕ロール', type: 'range', min: 0, max: 1, step: 0.05 },
+  { k: 'leapFingers',  label: '指駆動',    type: 'bool' },
+  { k: 'leapSmooth',   label: '指 平滑',   type: 'range', min: 0, max: 1, step: 0.05 },
+  { k: 'leapHandSwap', label: '手 左右入替', type: 'bool' },
+  { type: 'action',    label: '腕/指rest', btn: '再取得',    run: () => { armRest = null; fingerRig = null; } },
+  { sep: 'カメラ (キー1-4で呼出)' },
+  { type: 'action',    label: '視点1',     btn: '保存',      run: () => saveCamSlot(0) },
+  { type: 'action',    label: '視点2',     btn: '保存',      run: () => saveCamSlot(1) },
+  { type: 'action',    label: '視点3',     btn: '保存',      run: () => saveCamSlot(2) },
+  { type: 'action',    label: '視点4',     btn: '保存',      run: () => saveCamSlot(3) },
+  { sep: '背景 (OBS透過)' },
+  { k: 'bgTransparent', label: '背景 透過', type: 'bool' },
+  { k: 'bgColor',      label: '背景 色',   type: 'color' },
+];
+(function buildPanel() {
+  settingsEl.innerHTML = '<div class="ttl">⚙ 設定</div>';
+  const refs = [];
+  const changed = () => { saveCfg(); applySideEffects(); applyArmRestPose(); };   // 保存＋描画側(背景/collider/腕rest)へ即反映
+  for (const d of PANEL) {
+    if (d.sep) {                                              // セクション見出し(設定項目でない)
+      const s = document.createElement('div'); s.className = 'sep'; s.textContent = d.sep;
+      settingsEl.appendChild(s); continue;
+    }
+    const row = document.createElement('div'); row.className = 'row';
+    const lab = document.createElement('label'); lab.textContent = d.label; row.appendChild(lab);
+    if (d.type === 'range') {
+      const inp = document.createElement('input'); inp.type = 'range';
+      inp.min = d.min; inp.max = d.max; inp.step = d.step;
+      const dp = (String(d.step).split('.')[1] || '').length;   // 表示桁数はstepから(0.0001→4桁, 0.02→2桁)
+      const val = document.createElement('span'); val.className = 'val';
+      inp.oninput = () => { CFG[d.k] = +inp.value; val.textContent = (+inp.value).toFixed(dp); changed(); };
+      row.appendChild(inp); row.appendChild(val);
+      refs.push(() => { inp.value = CFG[d.k]; val.textContent = (+CFG[d.k]).toFixed(dp); });
+    } else if (d.type === 'sign') {
+      const btn = document.createElement('button');
+      btn.onclick = () => { CFG[d.k] = -CFG[d.k]; changed(); refreshPanel(); };
+      row.appendChild(btn);
+      refs.push(() => { btn.textContent = CFG[d.k] > 0 ? '正 ＋' : '反転 －'; });
+    } else if (d.type === 'choice') {
+      const btn = document.createElement('button');
+      btn.onclick = () => { const i = d.choices.indexOf(CFG[d.k]); CFG[d.k] = d.choices[(i + 1) % d.choices.length]; changed(); refreshPanel(); };
+      row.appendChild(btn);
+      refs.push(() => { btn.textContent = CFG[d.k]; });
+    } else if (d.type === 'bool') {
+      const btn = document.createElement('button');
+      btn.onclick = () => { CFG[d.k] = !CFG[d.k]; changed(); refreshPanel(); };
+      row.appendChild(btn);
+      refs.push(() => { btn.textContent = CFG[d.k] ? 'ON' : 'OFF'; });
+    } else if (d.type === 'color') {
+      const inp = document.createElement('input'); inp.type = 'color';
+      inp.oninput = () => { CFG[d.k] = inp.value; changed(); };
+      row.appendChild(inp);
+      refs.push(() => { inp.value = CFG[d.k]; });
+    } else if (d.type === 'action') {                        // 設定でなく動作(キャリブ/リセット等)
+      const btn = document.createElement('button'); btn.textContent = d.btn;
+      btn.onclick = () => { d.run(); refreshPanel(); };
+      row.appendChild(btn);
+    }
+    settingsEl.appendChild(row);
+  }
+  const rst = document.createElement('button'); rst.className = 'reset'; rst.textContent = '既定に戻す';
+  rst.onclick = () => { Object.assign(CFG, CFG_DEFAULTS); changed(); refreshPanel(); };
+  settingsEl.appendChild(rst);
+  refreshPanel = () => refs.forEach(f => f());
+  refreshPanel();
+})();
+loadCfg();   // サーバ(/config)から設定を読み込んで反映（別PCでも共有）
+
+// ---- scene ----
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+applySideEffects();   // 背景色/透過を初期反映(loadCfgが後で最新設定で再反映する)
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(30, innerWidth / innerHeight, 0.1, 20);
+camera.position.set(0, 1.35, 1.4);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.35, 0);
+controls.update();
+
+// カメラ視点の4スロット保存/呼出。保存=現在の位置と注視点を焼く。呼出=キー1-4 or 起動時スロット1。
+function saveCamSlot(i) {
+  if (!Array.isArray(CFG.camSlots)) CFG.camSlots = [null, null, null, null];
+  CFG.camSlots[i] = { p: camera.position.toArray(), t: controls.target.toArray() };
+  saveCfg();
+}
+function applyCamSlot(i) {
+  const s = CFG.camSlots && CFG.camSlots[i];
+  if (!s || !Array.isArray(s.p) || !Array.isArray(s.t)) return false;
+  camera.position.fromArray(s.p); controls.target.fromArray(s.t); controls.update();
+  return true;
+}
+
+const key = new THREE.DirectionalLight(0xffffff, Math.PI);
+key.position.set(1, 1, 1);
+scene.add(key);
+scene.add(new THREE.AmbientLight(0xffffff, 0.6 * Math.PI));
+
+// 可視化ドット（常に手前）。黄=raw頭position / シアン=neck(首)推定
+const mkDot = (color, r) => {
+  const m = new THREE.Mesh(new THREE.SphereGeometry(r, 16, 16),
+    new THREE.MeshBasicMaterial({ color, depthTest: false }));
+  m.renderOrder = 999; scene.add(m); return m;
+};
+const headDot = mkDot(0xffff00, 0.03);   // 黄: 生の頭position（回転混入で動く）
+const neckDot = mkDot(0x00e5ff, 0.025);  // シアン: 首(喉)推定＝回転由来変位を相殺した不変点
+const HEADDOT_GAIN = 5;    // position差分の可視化倍率
+
+// ==== Leap 手/指 (P1: 生ジョイントのデバッグ可視化) ====
+//   leap_raw_ws_bridge(:8202)から届く手JSONを保持し、animateで球を更新。
+//   座標変換はここに集約: 表示 = anchor + scale*sign*leap。実測で sign/anchor を合わせる。
+let leapHands = [];        // 最新フレームの手配列(パース済み)
+let leapWsState = 'connecting';
+const _lv = new THREE.Vector3();
+// ワークスペース中心。scaleは「この点からの差分」に掛かる＝scaleを変えても中心(anchor)がずれない(scaleとanchorを分離)。
+//   Leap空間で手が居る辺りの中心: X=0(左右手で対称), Y≈200mm(手の高さ), Z≈60mm(やや手前)。
+const LEAP_REF = [0, 200, 60];
+function leapToThreeInto(v, out) {   // v=[x,y,z]mm(Leap空間) → out(表示空間)。座標変換は全部ここ
+  return out.set(
+    CFG.leapAnchorX + CFG.leapScale * CFG.leapSignX * (v[0] - LEAP_REF[0]),
+    CFG.leapAnchorY + CFG.leapScale * CFG.leapSignY * (v[1] - LEAP_REF[1]),
+    CFG.leapAnchorZ + CFG.leapScale * CFG.leapSignZ * (v[2] - LEAP_REF[2]),
+  );
+}
+function leapToThree(v) { return leapToThreeInto(v, _lv); }   // 共有 _lv を返す(デバッグ球用)
+// デバッグ球プール(必要数だけ生成し使い回す)。指=小/白、palm=橙、wrist=緑、elbow=青。左手は色を暗く。
+const leapDotPool = [];
+let leapDotN = 0;
+const _leapSphere = new THREE.SphereGeometry(1, 8, 8);   // 単位球を共有。実寸は scale で(プール再利用でも効く)
+function nextDot(color, r) {
+  let m = leapDotPool[leapDotN];
+  if (!m) {
+    m = new THREE.Mesh(_leapSphere, new THREE.MeshBasicMaterial({ color, depthTest: false }));
+    m.renderOrder = 999; scene.add(m); leapDotPool[leapDotN] = m;
+  }
+  m.material.color.setHex(color); m.scale.setScalar(r); m.visible = true; leapDotN++;
+  return m;
+}
+function updateLeapDots() {
+  leapDotN = 0;
+  if (CFG.leapDebug && uiVisible) {
+    for (const hand of leapHands) {
+      const L = hand.s === 'l';
+      const cJoint = L ? 0x88aaff : 0xffffff;   // 指関節
+      const cPalm  = L ? 0xaa5500 : 0xff8800;
+      const cWrist = L ? 0x008844 : 0x00ff66;
+      const cElbow = L ? 0x0044aa : 0x0088ff;
+      nextDot(cPalm, 0.018).position.copy(leapToThree(hand.p));
+      if (hand.a) {
+        nextDot(cElbow, 0.016).position.copy(leapToThree(hand.a.e));
+        nextDot(cWrist, 0.016).position.copy(leapToThree(hand.a.w));
+      }
+      for (const dig of hand.d) for (const j of dig)
+        nextDot(cJoint, 0.008).position.copy(leapToThree(j));
+    }
+  }
+  for (let i = leapDotN; i < leapDotPool.length; i++) leapDotPool[i].visible = false;
+}
+function connectLeapWS() {
+  const ws = new WebSocket(`ws://${location.hostname}:8202`);   // 生Leap(手/指JSON)
+  ws.onopen = () => { leapWsState = 'OK'; };
+  ws.onclose = () => { leapWsState = 'closed, retry…'; leapHands = []; setTimeout(connectLeapWS, 1000); };
+  ws.onerror = () => {};
+  ws.onmessage = (ev) => { try { leapHands = (JSON.parse(ev.data).h) || []; } catch (e) { /* 壊れフレーム無視 */ } };
+}
+connectLeapWS();
+
+// スペースキーでUI(HUD/設定パネル)と診断ドットを一括トグル＝OBS配信時にワンキーで隠す。
+//   ※他キーは全廃(誤操作防止)だが、Spaceだけは「設定を変えない単純トグル」なので例外的に許可。
+// ?clean=1 で診断を全消し(HUD/パネル/黄シアンドット/Leap球)＝OBSブラウザソース用のクリーン映像。
+//   調整用は素のURL(診断出す)、本番ブラウザソースは …:8199/?clean=1 で両立。
+const CLEAN = new URLSearchParams(location.search).has('clean');
+let uiVisible = !CLEAN;
+function applyUI() {   // uiVisible を各表示へ反映(Leap球は updateLeapDots が uiVisible を見る)
+  statusEl.style.display = uiVisible ? '' : 'none';
+  settingsEl.style.display = uiVisible ? '' : 'none';
+  headDot.visible = uiVisible; neckDot.visible = uiVisible;
+}
+applyUI();   // 起動時反映(clean時は最初から非表示)
+addEventListener('keydown', (e) => {
+  if (e.key >= '1' && e.key <= '4') {          // 1-4: カメラ視点スロット呼出(設定は変えない=誤操作リスク無し)
+    if (applyCamSlot(+e.key - 1)) e.preventDefault();
+    return;
+  }
+  if (e.code !== 'Space' || CLEAN) return;     // Space: 診断トグル(clean時は常にクリーン維持で無効)
+  e.preventDefault();
+  uiVisible = !uiVisible;
+  applyUI();
+});
+
+// ---- expression 名前解決（VMC名 → 実在expression） ----
+const EXPR_ALIAS = {
+  fun: ['fun', 'happy', 'relaxed'], joy: ['joy', 'happy'], angry: ['angry'],
+  sorrow: ['sorrow', 'sad'], surprised: ['surprised'], neutral: ['neutral'],
+  blink: ['blink'], blink_l: ['blinkleft', 'blink_l'], blink_r: ['blinkright', 'blink_r'],
+  a: ['aa', 'a'], i: ['ih', 'i'], u: ['ou', 'u'], e: ['ee', 'e'], o: ['oh', 'o'],
+};
+const exprMap = new Map();   // lowercased -> 実名
+function resolveExpr(vmcName) {
+  const cands = EXPR_ALIAS[vmcName.toLowerCase()] || [vmcName.toLowerCase()];
+  for (const c of cands) { const a = exprMap.get(c); if (a) return a; }
+  return null;
+}
+
+// ---- load VRM ----
+let currentVRM = null;
+let faceMesh = null;              // VRoid表情morph(Fcl_*)を持つメッシュ。笑顔クリップの部位別morph存在チェック用
+let SMILE_FACE_EXPRS = [];        // 笑顔face(目+眉)exprの実名一覧。毎フレーム非アクティブを0にして二重適用を防ぐ
+const smileMouthBinds = [];       // 笑顔の口(Fcl_MTH_Fun)のbind。口角幅を CFG.smileWidth でライブ調整する
+const mouthOpenBinds = [];        // 口開き(Fcl_MTH_A=顎)のbind。開き具合を CFG.mouthGain でライブ調整(1.0超で誇張)
+const loader = new GLTFLoader();
+loader.register((parser) => new VRMLoaderPlugin(parser));
+
+// 髪/スカートが体を貫通する対策：自前の胴カプセルcolliderを全spring jointに登録。
+// （VRoid由来は既存colliderが背面/側面をカバーしきれず貫通しがち＝自前で足す）
+function addBodyColliders(vrm) {
+  const sm = vrm.springBoneManager;
+  if (!sm) { console.warn('[hair] springBoneManager無し＝spring bone未ロード'); return; }
+  const H = vrm.humanoid;
+  vrm.scene.updateMatrixWorld(true);
+  const hips = H.getNormalizedBoneNode('hips');
+  const top  = H.getNormalizedBoneNode('neck') || H.getNormalizedBoneNode('upperChest')
+            || H.getNormalizedBoneNode('chest') || H.getNormalizedBoneNode('head');
+  if (!hips || !top) { console.warn('[hair] hips/top ボーン無し'); return; }
+  // 胴カプセル: hips原点→top を hips-local で（ボーン軸の向きに依存しない）
+  const tailLocal = hips.worldToLocal(top.getWorldPosition(new THREE.Vector3()));
+  const shape = new VRMSpringBoneColliderShapeCapsule(
+    { radius: CFG.colliderR, offset: new THREE.Vector3(0, 0, 0), tail: tailLocal, inside: false });
+  const collider = new VRMSpringBoneCollider(shape);
+  hips.add(collider);
+  const group = { colliders: [collider], name: 'bodyCollider' };   // group=型なのでプレーンobjで作る
+  if (Array.isArray(sm.colliders)) sm.colliders.push(collider);
+  if (Array.isArray(sm.colliderGroups)) sm.colliderGroups.push(group);
+  let n = 0;
+  for (const joint of sm.joints) {
+    if (Array.isArray(joint.colliderGroups)) { joint.colliderGroups.push(group); n++; }
+  }
+  bodyColliderShapes.push(shape);
+  const radii = sm.colliders.map((c) => (c.shape && c.shape.radius != null ? +c.shape.radius.toFixed(3) : '?'));
+  console.log(`[hair] 胴カプセル追加 r=${CFG.colliderR} tailLocal=(${tailLocal.x.toFixed(2)},${tailLocal.y.toFixed(2)},${tailLocal.z.toFixed(2)}) 登録joint=${n}/${sm.joints.size}`);
+  console.log(`[hair] 既存collider数=${sm.colliders.length} group数=${sm.colliderGroups.length} 既存半径=`, radii);
+}
+
+loadInfo = 'loading VRM…'; setStatus();
+loader.load(
+  new URLSearchParams(location.search).get('vrm') || 'assets/model.vrm',
+  (gltf) => {
+    const vrm = gltf.userData.vrm;
+    VRMUtils.removeUnnecessaryVertices(gltf.scene);
+    VRMUtils.combineSkeletons(gltf.scene);
+    VRMUtils.rotateVRM0(vrm);
+    vrm.scene.traverse((o) => { o.frustumCulled = false; });
+    bodyPivot = new THREE.Group();   // 足元(原点)を軸に身体全体を傾ける器
+    bodyPivot.add(vrm.scene);
+    scene.add(bodyPivot);
+    currentVRM = vrm;
+    try { addBodyColliders(vrm); } catch (err) { console.warn('[hair] collider追加失敗:', err); }
+    if (vrm.lookAt) vrm.lookAt.autoUpdate = false;   // 目ボーンを手動制御（gaze）
+    if (vrm.expressionManager) {
+      for (const e of vrm.expressionManager.expressions) exprMap.set(e.expressionName.toLowerCase(), e.expressionName);
+    }
+    // 笑顔を部位別クリップに分けて VRMExpression として新規登録する(口の開き具合を制御するため)。
+    //   ⚠morphTargetInfluences 直叩きは three-vrm の update と競合して破綻(まつげ飛び/口固着)。
+    //     必ず正式API(VRMExpression + registerExpression)経由。three-vrm がリセット/再適用を管理してくれる。
+    //   構成を2分割:
+    //     smile{clip}face = Fcl_EYE_* + Fcl_BRW_* (目と眉の笑い、clip別)
+    //     smilemouth      = Fcl_MTH_Fun          (口角上げ＋横広げ・唇は閉じたまま)
+    //   ※morph変位を実測: Fcl_MTH_Fun は幅+26mm/開き+0.1mm＝広がるが唇は閉じたまま(:-)。
+    //     Fcl_MTH_Up は縦+8.6mm/幅-0.1mm＝上げるだけで広がらず真一文字(:-l)。だから Fun を使う。
+    //   口の開閉は lip-sync の 'A'(=Fcl_MTH_A,顎開き) と共存させる＝笑顔で口を開けると🍉形になる(suppressしない)。
+    //   口角の幅は CFG.smileWidth で bind.weight を可変(setValueは0..1に丸めるので増幅はbind側で行う)。
+    vrm.scene.traverse((o) => {
+      if (o.isMesh && o.morphTargetDictionary && 'Fcl_ALL_Fun' in o.morphTargetDictionary) faceMesh = o;
+    });
+    if (vrm.expressionManager && faceMesh) {
+      const cap = (s) => s[0].toUpperCase() + s.slice(1);            // 'fun'→'Fun'
+      const addMorphBinds = (expr, morphName, weight, sink) => {     // 同名morphを持つ全メッシュにバインド
+        vrm.scene.traverse((o) => {
+          if (o.isMesh && o.morphTargetDictionary && morphName in o.morphTargetDictionary) {
+            const b = new VRMExpressionMorphTargetBind(
+              { primitives: [o], index: o.morphTargetDictionary[morphName], weight });
+            expr.addBind(b); if (sink) sink.push(b);
+          }
+        });
+      };
+      const registerExpr = (name, binder) => {
+        const expr = new VRMExpression(name); binder(expr);
+        vrm.scene.add(expr); vrm.expressionManager.registerExpression(expr); exprMap.set(name, name);
+      };
+      for (const clip of ['fun', 'joy']) {                           // 目+眉の笑い(clip別)
+        if (!(`Fcl_EYE_${cap(clip)}` in faceMesh.morphTargetDictionary)) continue;
+        registerExpr(`smile${clip}face`, (e) => {
+          addMorphBinds(e, `Fcl_EYE_${cap(clip)}`, 1.0); addMorphBinds(e, `Fcl_BRW_${cap(clip)}`, 1.0);
+        });
+      }
+      if ('Fcl_MTH_Fun' in faceMesh.morphTargetDictionary)           // 笑いの口(口角上げ＋横広げ、閉じたまま)
+        registerExpr('smilemouth', (e) => addMorphBinds(e, 'Fcl_MTH_Fun', CFG.smileWidth, smileMouthBinds));
+      if ('Fcl_MTH_A' in faceMesh.morphTargetDictionary)             // 口開き(顎)。既定 'aa' の代わりに使い、開き具合を可変に
+        registerExpr('mouthopen', (e) => addMorphBinds(e, 'Fcl_MTH_A', CFG.mouthGain, mouthOpenBinds));
+      // 笑顔face実名(重複除去)。複合(fun/joy)は VRM0→1 で relaxed/happy 等に化けるため resolveExpr で解決
+      SMILE_FACE_EXPRS = [resolveExpr('fun'), resolveExpr('joy'),
+                          exprMap.get('smilefunface'), exprMap.get('smilejoyface')]
+                         .filter((v, i, a) => v && a.indexOf(v) === i);
+    }
+    loadInfo = `VRM ✓ v${vrm.meta?.metaVersion ?? '0'}  mirror=data\nexpr: ${[...exprMap.values()].join(',')}`;
+    setStatus('ws: connecting');
+    applyArmRestPose();   // 直立・腕下ろしrestへ(モデルのT/Aポーズをやめる)
+  },
+  (p) => { loadInfo = `loading VRM… ${(p.loaded / (p.total || p.loaded) * 100 | 0)}%`; setStatus(); },
+  (e) => { loadInfo = 'VRM load ERROR:\n' + (e?.message || e); setStatus(); console.error(e); }
+);
+
+// ---- VMC over WebSocket ----
+const boneRot = new Map();          // threeName -> THREE.Quaternion
+const blendVal = new Map();         // vmcName -> value
+let rootPos = null;                 // [x,y,z]
+let rootBase = null;                // 安静時の基準position
+let posEMA = null;                  // 平滑化した頭position
+let neckBase = null;                // 首(喉)位置の安静基準 [x,y,z]（表示空間）
+let bodyPivot = null;               // 足元を軸に身体全体を傾けるグループ（現在は撤去・恒等のまま）
+let legRest = null;                 // 脚の安静時ジオメトリ（IKのピン先/骨長/ポール/足rest姿勢）
+let sigEMA = null;                  // 平滑化した首信号 [x,y,z]
+let wsState = 'connecting';
+const vmcToThree = (n) => n[0].toLowerCase() + n.slice(1);
+
+// Unity(左手)→three(右手) + 左右ミラー を1箇所で
+function convertQuat(r, q) {
+  q.set(-r[0], -r[1], r[2], r[3]);   // Unity->three 座標変換のみ。左右ミラーは setBone の (x,-y,-z,w) で行う
+}
+function convertVec3(v) {             // 位置も回転と同一基底で変換（per-channelな符号いじりを排除）
+  return [-v[0], -v[1], v[2]];
+}
+// 目線専用: 生(Unity)eye quat を Euler(XYZ)に分解し、pitch(上下)を中心補正→増幅→符号、
+//   yaw(左右)を等倍、roll=0 にしてから three 基底(-x,-y,z,w=convertQuatと同一)へ戻す。
+//   ※上流でpitchが潰れてるのを増幅して復元する。small-angleなのでEuler分解で十分正確。
+const _eeu = new THREE.Euler();
+const _eq  = new THREE.Quaternion();
+function convertEyeQuat(r, out) {
+  _eq.set(r[0], r[1], r[2], r[3]);
+  _eeu.setFromQuaternion(_eq, 'XYZ');
+  _eeu.x = _eeu.x * CFG.eyePitchGain * CFG.eyePitchSign;   // 第1成分=アバター上下(j/J,k)
+  _eeu.y = _eeu.y * CFG.eyeYawGain   * CFG.eyeYawSign;     // 第2成分=アバター左右(g/G,l)
+  _eeu.z = 0;                                                          // roll は捨てる
+  _eq.setFromEuler(_eeu);
+  out.set(-_eq.x, -_eq.y, _eq.z, _eq.w);
+}
+
+// ---- 生iFM(テキスト)を直接parseして boneRot/blendVal/rootPos を組む ----
+//   VMC加工を挟まず、VSFと同じ生データを処理する。表情計算は旧ブリッジの calc_* を移植。
+//   これで削られてた情報(眼球回転・左右別Blink 等)が全部rendererに届く＝以降は全部ここで調整できる。
+const D2R = Math.PI / 180;
+const _ifmQ = new THREE.Quaternion(), _ifmE = new THREE.Euler();
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+function eulerDegToQuat(rx, ry, rz) {   // X→Y→Z(iFM/旧ブリッジと同順)。戻り値は共有quat
+  _ifmE.set(rx * D2R, ry * D2R, rz * D2R, 'XYZ');
+  return _ifmQ.setFromEuler(_ifmE);
+}
+function ifmVal(text, key) {            // 'key-数値' を返す。無ければ0
+  const pre = key + '-';
+  for (const p of text.split('|')) if (p.startsWith(pre)) { const v = parseFloat(p.slice(pre.length)); return isNaN(v) ? 0 : v; }
+  return 0;
+}
+function ifmVec(text, tag) {            // '=head#..' / 'leftEye#..' / 'rightEye#..' の数値配列
+  for (const p of text.split('|')) if (p.startsWith(tag)) {
+    const n = p.slice(tag.length).split(',').map(Number);
+    return n.some(Number.isNaN) ? null : n;
+  }
+  return null;
+}
+function setBone(tn, r, eye) {
+  let q = boneRot.get(tn); if (!q) { q = new THREE.Quaternion(); boneRot.set(tn, q); }
+  eye ? convertEyeQuat(r, q) : convertQuat(r, q);
+  // 左右ミラー: ワールドX面での鏡映 = クォータニオンの (x,-y,-z,w)。旧CSS scaleX(-1) と等価だがメッシュは反転しない。
+  //   カメラ正面固定(画面X=ワールドX)なので旧見た目を完全再現しつつアホ毛等の非対称メッシュだけ正しくなる。
+  if (CFG.mirror) q.set(q.x, -q.y, -q.z, q.w);
+}
+function processRawIFM(text) {
+  // 表情(旧ブリッジ calc_* 移植)
+  const fun = clamp01(((ifmVal(text, 'mouthSmile_L') + ifmVal(text, 'mouthSmile_R')) / 2) / 100 * CFG.smileGain);
+  let angry = clamp01((ifmVal(text, 'browDown_L') + ifmVal(text, 'browDown_R')) / 300);
+  const bo = ifmVal(text, 'browOuterUp_L') * 0.5 + ifmVal(text, 'browOuterUp_R') * 0.5;
+  const inner = ifmVal(text, 'browInnerUp');
+  const savg = (bo + inner) / 3;
+  let surprise = inner < 20 ? clamp01(savg / 300) : clamp01(savg / 100);
+  if (fun > 0.1) { surprise = 0.1; angry = 0.1; }         // 旧ブリッジの抑制
+  if (surprise < 0.2) surprise = (surprise - 0.2) * surprise;
+  blendVal.set('Fun', fun); blendVal.set('Angry', angry); blendVal.set('Surprised', surprise);
+  // 瞬き/ウィンク(左右別)・口(jawOpen 閾値 CFG.mouthThresh 未満は無反応、そこから100%までを0..1に伸ばす)
+  blendVal.set('Blink_L', clamp01(ifmVal(text, 'eyeBlink_L') / 100));
+  blendVal.set('Blink_R', clamp01(ifmVal(text, 'eyeBlink_R') / 100));
+  const jo = ifmVal(text, 'jawOpen') / 100;
+  blendVal.set('A', clamp01((jo - CFG.mouthThresh) / Math.max(0.01, 1 - CFG.mouthThresh)));
+  // 頭(rot deg + pos)
+  const h = ifmVec(text, '=head#');
+  if (h && h.length >= 6) {
+    const q = eulerDegToQuat(h[0], h[1], h[2]);
+    setBone('head', [q.x, q.y, q.z, q.w], false);
+    rootPos = [CFG.mirror ? -h[3] : h[3], h[4], h[5]];   // 頭position X も鏡映(首信号/体駆動/ドットが一貫して鏡になる)
+  }
+  // 目線(眼球回転。rx=左右/ry=上下、両目平均→convertEyeQuatでgain/sign適用)
+  const le = ifmVec(text, 'leftEye#'), re = ifmVec(text, 'rightEye#');
+  if (le && re && le.length >= 2 && re.length >= 2) {
+    const q = eulerDegToQuat((le[0] + re[0]) / 2, (le[1] + re[1]) / 2, 0);
+    setBone('leftEye', [q.x, q.y, q.z, q.w], true);
+    setBone('rightEye', [q.x, q.y, q.z, q.w], true);
+  }
+}
+function connectWS() {
+  const ws = new WebSocket(`ws://${location.hostname}:8201`);   // 生iFM(VSFと同じ生データ)を直接処理
+  ws.onopen = () => { wsState = 'OK'; };
+  ws.onclose = () => { wsState = 'closed, retry…'; setTimeout(connectWS, 1000); };
+  ws.onerror = () => {};
+  ws.onmessage = (ev) => { try { processRawIFM(ev.data); } catch (e) { /* 壊れたフレームは無視 */ } };
+}
+connectWS();
+
+const _neckTmp = new THREE.Vector3();
+const _mtmp = new THREE.Matrix4();
+
+// ==== 自動キャリブレーション ====
+// モデル: head_pos(表示) = R_head·anchor + c  （c=首の定点）。頭を色々動かした多数サンプルから
+// anchor と c を最小二乗で解く。R_headは回転行列なので RᵀR=I が効き、解は 3x3 を1回解くだけになる：
+//   (N²·I − SᵀS)·anchor = N·g1 − Sᵀ·g2,   S=ΣR, g1=ΣRᵀp, g2=Σp
+let calib = null;        // 蓄積中は {N,S[9],g1[3],g2[3]}。nullで非キャリブ
+let calibMsg = 'キャリブ: パネル「キャリブ」で開始→頭を回す→もう一度で確定';
+function toggleCalib() {   // パネルの「キャリブ」ボタン。1回目=記録開始、2回目=確定(旧 'c' キー)
+  if (!calib) { calib = { N: 0, S: new Array(9).fill(0), g1: [0,0,0], g2: [0,0,0] };
+                calibMsg = '記録中… 頷く/振る/傾げるをゆっくり大きく → もう一度「キャリブ」で確定'; }
+  else finishCalib();
+}
+
+function solve3(A, b) {  // A:[9] row-major, b:[3] → x or null(特異)
+  const d =
+    A[0]*(A[4]*A[8]-A[5]*A[7]) - A[1]*(A[3]*A[8]-A[5]*A[6]) + A[2]*(A[3]*A[7]-A[4]*A[6]);
+  if (Math.abs(d) < 1e-9) return null;
+  const c = [ // 余因子（逆行列 × det）
+    (A[4]*A[8]-A[5]*A[7]), (A[2]*A[7]-A[1]*A[8]), (A[1]*A[5]-A[2]*A[4]),
+    (A[5]*A[6]-A[3]*A[8]), (A[0]*A[8]-A[2]*A[6]), (A[2]*A[3]-A[0]*A[5]),
+    (A[3]*A[7]-A[4]*A[6]), (A[1]*A[6]-A[0]*A[7]), (A[0]*A[4]-A[1]*A[3]) ];
+  return [ (c[0]*b[0]+c[1]*b[1]+c[2]*b[2])/d,
+           (c[3]*b[0]+c[4]*b[1]+c[5]*b[2])/d,
+           (c[6]*b[0]+c[7]*b[1]+c[8]*b[2])/d ];
+}
+
+function calibAccum(R, p) {   // R:[9] row-major, p:[3]（表示空間の頭position）
+  const k = calib; k.N++;
+  for (let i = 0; i < 9; i++) k.S[i] += R[i];
+  for (let i = 0; i < 3; i++) {
+    k.g2[i] += p[i];
+    k.g1[i] += R[0*3+i]*p[0] + R[1*3+i]*p[1] + R[2*3+i]*p[2];  // (Rᵀp)[i]
+  }
+}
+
+function finishCalib() {
+  const { N, S, g1, g2 } = calib; calib = null;
+  if (N < 40) { calibMsg = `試行不足(N=${N})。[c]でやり直し、頭を大きくゆっくり回す`; return; }
+  // SᵀS と Sᵀg2
+  const StS = new Array(9).fill(0), Stg2 = [0,0,0];
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++)
+    for (let kk = 0; kk < 3; kk++) StS[i*3+j] += S[kk*3+i]*S[kk*3+j];
+  for (let i = 0; i < 3; i++) for (let kk = 0; kk < 3; kk++) Stg2[i] += S[kk*3+i]*g2[kk];
+  const A = StS.map((v,i) => (i%4===0 ? N*N : 0) - v);        // N²I − SᵀS
+  const rhs = [ N*g1[0]-Stg2[0], N*g1[1]-Stg2[1], N*g1[2]-Stg2[2] ];
+  const a = solve3(A, rhs);
+  if (!a) { calibMsg = '動きが足りず特異。頷く/振る/傾げるを全部やる'; return; }
+  NECK_ANCHOR.set(a[0], a[1], a[2]);
+  CFG.neckAnchor = [a[0], a[1], a[2]]; saveCfg();   // 保存＝リロードで首ドットのズレが復活しない
+  neckBase = null; rootBase = null;   // 基準取り直し
+  calibMsg = `✓解決 anchor=(${a[0].toFixed(3)},${a[1].toFixed(3)},${a[2].toFixed(3)}) N=${N}`;
+}
+
+// ==== 上半身駆動：hips平行移動＋足ピン2ボーンIK ====
+const _bvec = new THREE.Vector3(), _dvec = new THREE.Vector3();
+const _yAxis = new THREE.Vector3(0, 1, 0), _upTmp = new THREE.Vector3();
+
+function captureLegRest(h) {   // ロード後・最初の有効フレームで1回
+  const P = (n) => h.getNormalizedBoneNode(n);
+  const need = ['hips','leftUpperLeg','leftLowerLeg','leftFoot',
+                'rightUpperLeg','rightLowerLeg','rightFoot'];
+  for (const n of need) if (!P(n)) return null;   // 必須ボーン欠落なら諦め
+  const wp = (n) => P(n).getWorldPosition(new THREE.Vector3());
+  const mk = (side) => {
+    const hip = wp(side+'UpperLeg'), knee = wp(side+'LowerLeg'), ankle = wp(side+'Foot');
+    const L1 = hip.distanceTo(knee), L2 = knee.distanceTo(ankle);
+    const dir = ankle.clone().sub(hip).normalize();
+    const bend = knee.clone().sub(hip);
+    bend.addScaledVector(dir, -bend.dot(dir));      // hip→ankle直線に対する膝の垂直成分＝屈曲方向
+    let pole;
+    if (bend.lengthSq() > 1e-6) pole = bend.normalize();
+    else pole = new THREE.Vector3(0,0,-1)           // rest棒立ちで退化→キャラ前方にフォールバック
+      .applyQuaternion(P('hips').getWorldQuaternion(new THREE.Quaternion())).normalize();
+    const footRestWorldQ = P(side+'Foot').getWorldQuaternion(new THREE.Quaternion());
+    return { L1, L2, ankleTarget: ankle.clone(), pole, footRestWorldQ };
+  };
+  return { hipsRestWorld: wp('hips'), L: mk('left'), R: mk('right') };
+}
+
+// world回転デルタ qDelta を node の現world姿勢に乗せてローカルへ（rest捻り管理不要・自己補正）
+function applyWorldDelta(node, qDelta) {
+  const w = node.getWorldQuaternion(new THREE.Quaternion());
+  const pInv = node.parent.getWorldQuaternion(new THREE.Quaternion()).invert();
+  node.quaternion.copy(pInv).multiply(qDelta).multiply(w);
+}
+
+function solveLeg(h, side, R) {   // 射影法2ボーンIK：足首を R.ankleTarget にピン留め
+  const up = h.getNormalizedBoneNode(side+'UpperLeg');
+  const lo = h.getNormalizedBoneNode(side+'LowerLeg');
+  const ft = h.getNormalizedBoneNode(side+'Foot');
+  const hip = up.getWorldPosition(new THREE.Vector3());
+  const target = R.ankleTarget, L1 = R.L1, L2 = R.L2;
+  const dir = target.clone().sub(hip);
+  let dist = dir.length();
+  if (dist < 1e-6) return;
+  dir.divideScalar(dist);
+  const minr = Math.abs(L1 - L2), reach = L1 + L2;
+  dist = THREE.MathUtils.clamp(dist, minr + 1e-3, reach - STRAIGHT_MARGIN);  // 伸びきり/折れ込み回避
+  const proj = (dist*dist + L1*L1 - L2*L2) / (2*dist);
+  const hgt = Math.sqrt(Math.max(0, L1*L1 - proj*proj));                     // acos不使用でNaN回避
+  const bendDir = R.pole.clone().addScaledVector(dir, -R.pole.dot(dir));     // pole⊥dir
+  if (bendDir.lengthSq() < 1e-8) bendDir.set(0,0,-1).addScaledVector(dir, -dir.z);
+  bendDir.normalize();
+  const kneePos = hip.clone().addScaledVector(dir, proj).addScaledVector(bendDir, hgt);
+  // 腿: 現膝方向 → 目標膝方向
+  const kneeCur = lo.getWorldPosition(new THREE.Vector3());
+  applyWorldDelta(up, new THREE.Quaternion().setFromUnitVectors(
+    kneeCur.sub(hip).normalize(), kneePos.clone().sub(hip).normalize()));
+  up.updateWorldMatrix(false, true);
+  // 脛: 現足首方向 → 目標(ピン)方向
+  const knee = lo.getWorldPosition(new THREE.Vector3());
+  const ankleCur = ft.getWorldPosition(new THREE.Vector3());
+  applyWorldDelta(lo, new THREE.Quaternion().setFromUnitVectors(
+    ankleCur.sub(knee).normalize(), target.clone().sub(knee).normalize()));
+  lo.updateWorldMatrix(false, true);
+  // 足平: rest world姿勢へ戻す＝ソール水平維持
+  const fp = ft.parent.getWorldQuaternion(new THREE.Quaternion()).invert();
+  ft.quaternion.copy(fp).multiply(R.footRestWorldQ);
+  ft.updateWorldMatrix(false, true);
+}
+
+function driveBody(h, sx, sy, sz) {   // 首信号(neckBase基準) → hips平行移動＋脚IK
+  if (!legRest) { legRest = captureLegRest(h); if (!legRest) return; }
+  const dz = (v) => { const m = Math.abs(v) - CFG.bodyDeadzone; return m > 0 ? Math.sign(v)*m : 0; };
+  const raw = [dz(sx), dz(sy), dz(sz)];
+  if (!sigEMA) sigEMA = raw.slice();
+  for (let i = 0; i < 3; i++) sigEMA[i] = sigEMA[i]*0.8 + raw[i]*0.2;   // 平滑化(iFMノイズ対策)
+  const cl = (v,m) => Math.max(-m, Math.min(m, v));
+  const on = CFG.bodyDrive ? 1 : 0;
+  _bvec.set(
+    on * cl(CFG.signX*CFG.gainMul*GAIN_LAT  * sigEMA[0], LAT_MAX),    // 左右＝重心移動
+    on * cl(CFG.signY*CFG.gainMul*GAIN_VERT * sigEMA[1], VERT_MAX),   // 上下＝背伸び/沈み
+    on * cl(         CFG.gainMul*GAIN_DEPTH* sigEMA[2], DEPTH_MAX)); // 前後（今回オフ, GAIN_DEPTH=0）
+  const hipsNode = h.getNormalizedBoneNode('hips');
+  _dvec.copy(legRest.hipsRestWorld).add(_bvec);
+  hipsNode.position.copy(hipsNode.parent.worldToLocal(_dvec));   // world→hips親ローカル
+  hipsNode.updateWorldMatrix(true, true);                        // 脚サブツリーを更新してからIK
+  if (CFG.ikEnabled) { solveLeg(h, 'left', legRest.L); solveLeg(h, 'right', legRest.R); }
+
+  // 頭の傾げ(roll)→胴をその方向へわずかにヨー。spineを回す＝hips/脚(ピン留め)は不動
+  const spine = h.getNormalizedBoneNode('spine') || h.getNormalizedBoneNode('chest');
+  if (spine) {
+    let turn = 0;
+    const Rh = boneRot.get('head');
+    if (CFG.bodyDrive && Rh) {
+      _upTmp.set(0, 1, 0).applyQuaternion(Rh);           // 頭の上ベクトルの倒れ＝roll量
+      const roll = Math.atan2(_upTmp.x, _upTmp.y);
+      turn = Math.max(-TURN_MAX, Math.min(TURN_MAX, CFG.signT * TURN_GAIN * roll));
+    }
+    spine.quaternion.setFromAxisAngle(_yAxis, turn);     // spineはVMC非駆動なので直接owned
+  }
+}
+
+// ==== Leap 腕IK (P3) ====  肩固定・手首をLeapの手首位置へ2ボーンIKでピン留め(脚IKの流用)。
+//   手が前に出るので指(P2)が見えるようになる。手ロスト/OFF時は rest 姿勢へ緩やか復帰。
+//   手首の"向き"はまだ駆動せず前腕に自然追従(restローカル維持)。向き精緻化は後段。
+// 手のひらの向きを"位置"から正規直交基底(quat)に。反射(leapSign)込みの位置から作るので鏡映も一貫。
+//   X=横(小指→人差し指) / Y=手のひら法線 / Z=前方(手首→中指付け根)。rest/現在で同式＝定数で相殺。
+const _hf = new THREE.Vector3(), _hs = new THREE.Vector3(), _hn = new THREE.Vector3();
+const _hm = new THREE.Matrix4();
+function handBasisQ(wrist, pMid, pIdx, pPnk, out) {
+  _hf.copy(pMid).sub(wrist).normalize();        // 前方(指方向)
+  _hs.copy(pIdx).sub(pPnk).normalize();         // 横
+  _hn.crossVectors(_hf, _hs).normalize();       // 手のひら法線
+  _hs.crossVectors(_hn, _hf).normalize();       // 直交化(右手系を保証)
+  _hm.makeBasis(_hs, _hn, _hf);
+  return out.setFromRotationMatrix(_hm);
+}
+// swing-twist分解のtwist成分: q のうち axis まわりのひねりだけを取り出す(axis・qは同一フレーム・axisは単位)
+function twistAbout(q, axis, out) {
+  const d = q.x*axis.x + q.y*axis.y + q.z*axis.z;   // 回転ベクトルを軸へ射影
+  out.set(axis.x*d, axis.y*d, axis.z*d, q.w);
+  const len = Math.hypot(out.x, out.y, out.z, out.w);
+  if (len < 1e-8) { out.set(0, 0, 0, 1); return out; }   // 特異(180°swing)→ひねり無し
+  out.x /= len; out.y /= len; out.z /= len; out.w /= len;
+  if (out.w < 0) { out.x = -out.x; out.y = -out.y; out.z = -out.z; out.w = -out.w; }  // 半球統一
+  return out;
+}
+let armRest = null;   // {left:{...}|null, right:...}。null で次フレーム再取得
+function captureArmRest(h) {
+  const P = (n) => h.getNormalizedBoneNode(n);
+  const sides = {};
+  for (const side of ['left', 'right']) {
+    const up = P(side + 'UpperArm'), lo = P(side + 'LowerArm'), hd = P(side + 'Hand');
+    if (!up || !lo || !hd) { sides[side] = null; continue; }
+    const sh = P(side + 'Shoulder');   // 鎖骨。腕を上げると連動して開く(VSF流)。無いモデルはnull
+    up.updateWorldMatrix(true, false);
+    const wp = (n) => n.getWorldPosition(new THREE.Vector3());
+    const shoulder = wp(up), elbow = wp(lo), wrist = wp(hd);
+    const L1 = shoulder.distanceTo(elbow), L2 = elbow.distanceTo(wrist);
+    const dir = wrist.clone().sub(shoulder).normalize();
+    const bend = elbow.clone().sub(shoulder); bend.addScaledVector(dir, -bend.dot(dir));
+    let pole;
+    if (bend.lengthSq() > 1e-6) pole = bend.normalize();
+    else pole = new THREE.Vector3(0, -0.5, -1).normalize();   // T/Aポーズ退化→肘は下後方へ
+    // 手首向き用の定数 handConst = B_rest⁻¹·Q_rest。B_current·handConst で hand world を復元(rest時=Q_rest)
+    let handConst = null;
+    const mid = P(side + 'MiddleProximal'), idx = P(side + 'IndexProximal'), pnk = P(side + 'LittleProximal');
+    if (mid && idx && pnk) {
+      const Brest = handBasisQ(wrist, wp(mid), wp(idx), wp(pnk), new THREE.Quaternion());
+      const Qrest = hd.getWorldQuaternion(new THREE.Quaternion());
+      handConst = Brest.invert().multiply(Qrest);
+    }
+    // 前腕の長軸(肘→手首)を lo-ローカルで＝ひねりの軸。rest手のこの軸まわりのひねり twist0 を控える(中立=rest維持用)
+    const foreAxisLocal = elbow.clone().sub(wrist).multiplyScalar(-1).normalize()   // = wrist-elbow
+      .applyQuaternion(lo.getWorldQuaternion(new THREE.Quaternion()).invert()).normalize();
+    const twist0 = twistAbout(hd.quaternion, foreAxisLocal, new THREE.Quaternion());
+    const twist0Inv = twist0.clone().invert();
+    // 上腕の長軸(肩→肘)を up-ローカルで＝ひねり分散の軸。ここに回内/回外の一部を逃がす(VSF流・肘軸で不動)
+    const upAxisLocal = elbow.clone().sub(shoulder).normalize()
+      .applyQuaternion(up.getWorldQuaternion(new THREE.Quaternion()).invert()).normalize();
+    sides[side] = { up, lo, hd, sh, restSh: sh ? sh.quaternion.clone() : null,   // 肩(鎖骨)とそのrest
+      L1, L2, pole, handConst, foreAxisLocal, twist0, twist0Inv,
+      upAxisLocal, upRoll: 0,   // upRoll=上腕に現在乗せてるロール角(差分適用で累積回避)
+      elbowT: elbow.clone(),    // Leap肘位置のEMA状態(pole=曲げ方向をここから決める)
+      restUp: up.quaternion.clone(), restLo: lo.quaternion.clone(), restHd: hd.quaternion.clone(),
+      restWrist: wrist.clone(), target: wrist.clone() };   // target=位置EMAの状態
+  }
+  return sides;
+}
+// restを直立・腕下ろし姿勢へ差し替える。モデルのbind(T/A)から上腕を鉛直付近へ倒す＝肩の可動域が上に開く。
+//   これを基準に armRest(pole/handConst/restUp/restSh) を取り直す(指restは姿勢非依存なので触らない)。
+let armBind = null;        // モデル本来のbind局所回転(側→{up,sh,upQ,shQ})。1回だけ捕捉
+let _lastRestKey = '';     // rest姿勢パラメータのキャッシュキー(変化時のみ再適用)
+const _rpA = new THREE.Vector3(), _rpB = new THREE.Vector3(), _rpDir = new THREE.Vector3();
+const _rpTgt = new THREE.Vector3(), _rpDelta = new THREE.Quaternion();
+function applyArmRestPose() {
+  if (!currentVRM) return;
+  const key = `${CFG.leapRestPose}|${CFG.leapRestArmOut}`;
+  if (key === _lastRestKey && armRest) return;     // 変化なし&capture済みなら何もしない(汎用changeで無駄打ちしない)
+  _lastRestKey = key;
+  const h = currentVRM.humanoid;
+  if (!armBind) {                                  // bind(モデル本来の姿勢)を1回だけ控える
+    armBind = {};
+    for (const side of ['left', 'right']) {
+      const up = h.getNormalizedBoneNode(side + 'UpperArm'), sh = h.getNormalizedBoneNode(side + 'Shoulder');
+      armBind[side] = { up, sh, upQ: up ? up.quaternion.clone() : null, shQ: sh ? sh.quaternion.clone() : null };
+    }
+  }
+  for (const side of ['left', 'right']) {
+    const b = armBind[side]; if (!b.up) continue;
+    b.up.quaternion.copy(b.upQ);                   // 一旦bindへ戻す
+    if (b.sh) b.sh.quaternion.copy(b.shQ);
+    if (CFG.leapRestPose) {                         // 腕を下ろす: 上腕を「鉛直から leapRestArmOut°開いた下向き」へ
+      b.up.updateWorldMatrix(true, false);
+      const lo = h.getNormalizedBoneNode(side + 'LowerArm');
+      b.up.getWorldPosition(_rpA); lo.getWorldPosition(_rpB);
+      _rpDir.copy(_rpB).sub(_rpA).normalize();     // bindの上腕方向(肩→肘)
+      const out = (side === 'left' ? 1 : -1), a = THREE.MathUtils.degToRad(CFG.leapRestArmOut);
+      _rpTgt.set(out * Math.sin(a), -Math.cos(a), 0.08).normalize();   // 下向き＋わずかに開いて前へ
+      applyWorldDelta(b.up, _rpDelta.setFromUnitVectors(_rpDir, _rpTgt));
+      b.up.updateWorldMatrix(false, true);
+    }
+  }
+  armRest = null;   // 新しいrest姿勢で腕restを取り直す(次フレームのcaptureArmRestが読む)
+}
+const _armTgt = new THREE.Vector3(), _aHip = new THREE.Vector3(), _aDir = new THREE.Vector3();
+const _aElbow = new THREE.Vector3(), _aCur = new THREE.Vector3(), _aBend = new THREE.Vector3();
+const _armElb = new THREE.Vector3(), _aPole = new THREE.Vector3();
+const _shPos = new THREE.Vector3(), _shAim = new THREE.Quaternion();
+const _fdir = new THREE.Vector3(), _eIdeal = new THREE.Vector3();
+function solveArm(h, R, rawTarget, elbowWorld) {   // 脚IK(solveLeg)と同じ射影法。手首=IK、肘の曲げ方向=Leap実肘
+  R.target.lerp(rawTarget, CFG.leapArmSmooth <= 0 ? 1 : CFG.leapArmSmooth);
+  const target = R.target, up = R.up, lo = R.lo, ft = R.hd, L1 = R.L1, L2 = R.L2;
+  // 0) 肩(鎖骨)を手首目標へ部分的にaim＝手を上げると肩が上がる(挙上)。rest基準で毎F再構築(累積させず一定割合)
+  if (R.sh && R.restSh && CFG.leapShoulder) {
+    R.sh.quaternion.copy(R.restSh);                 // 一旦restへ戻す(割合を絶対量に固定)
+    R.sh.updateWorldMatrix(true, false);
+    R.sh.getWorldPosition(_shPos);
+    up.getWorldPosition(_aCur);                      // rest肩姿勢での上腕origin
+    _aDir.copy(_aCur).sub(_shPos);                   // 肩→上腕 現方向
+    _aPole.copy(target).sub(_shPos);                 // 肩→手首目標
+    if (_aDir.lengthSq() > 1e-8 && _aPole.lengthSq() > 1e-8) {
+      _shAim.setFromUnitVectors(_aDir.normalize(), _aPole.normalize());
+      _shAim.slerp(_idQ, 1 - CFG.leapShoulderGain);  // 目標方向へ gain 割合だけ肩を開く
+      applyWorldDelta(R.sh, _shAim);
+      R.sh.updateWorldMatrix(false, true);
+    }
+  }
+  up.updateWorldMatrix(true, false);   // 肩チェーンをこのフレームの姿勢へ(顔トラッキング無し/hips未更新でもstale回避)
+  up.getWorldPosition(_aHip);
+  _aDir.copy(target).sub(_aHip); let dist = _aDir.length();
+  if (dist < 1e-6) return; _aDir.divideScalar(dist);
+  const minr = Math.abs(L1 - L2), reach = L1 + L2;
+  dist = THREE.MathUtils.clamp(dist, minr + 1e-3, reach - 0.01);   // 伸びきり/折れ込み回避
+  const proj = (dist*dist + L1*L1 - L2*L2) / (2*dist);
+  const hgt = Math.sqrt(Math.max(0, L1*L1 - proj*proj));
+  // pole(肘の曲げ方向): Leap実肘の位置を狙点に(＝上腕/前腕どちらの角度も反映した実際の肘位置)。肘データ無しはrest pole。
+  if (elbowWorld && CFG.leapElbowPole) {
+    R.elbowT.lerp(elbowWorld, CFG.leapArmSmooth <= 0 ? 1 : CFG.leapArmSmooth);   // 肘EMA(Leap肘のノイズ平滑)
+    _aPole.copy(R.elbowT).sub(_aHip);
+  } else _aPole.copy(R.pole);
+  _aPole.y -= CFG.leapElbowDown;   // 肘下げバイアス: pole(曲げ方向)を下へ引く＝肘が落ちる
+  _aBend.copy(_aPole).addScaledVector(_aDir, -_aPole.dot(_aDir));
+  if (_aBend.lengthSq() < 1e-8) {                       // dirと平行に退化→restで再試行→最後は下方向
+    _aBend.copy(R.pole).addScaledVector(_aDir, -R.pole.dot(_aDir));
+    if (_aBend.lengthSq() < 1e-8) _aBend.set(0, -1, 0).addScaledVector(_aDir, -_aDir.y);
+  }
+  _aBend.normalize();
+  _aElbow.copy(_aHip).addScaledVector(_aDir, proj).addScaledVector(_aBend, hgt);   // 目標肘位置
+  lo.getWorldPosition(_aCur);   // 現・肘位置
+  applyWorldDelta(up, new THREE.Quaternion().setFromUnitVectors(
+    _aCur.sub(_aHip).normalize(), _aElbow.clone().sub(_aHip).normalize()));
+  up.updateWorldMatrix(false, true);
+  lo.getWorldPosition(_aElbow);   // 更新後の肘
+  ft.getWorldPosition(_aCur);     // 現・手首
+  applyWorldDelta(lo, new THREE.Quaternion().setFromUnitVectors(
+    _aCur.sub(_aElbow).normalize(), target.clone().sub(_aElbow).normalize()));
+  lo.updateWorldMatrix(false, true);
+  // 手(hd)は駆動せず＝前腕に自然追従(restローカル維持)。指はこの手を親に曲がる。
+}
+const _wWrist = new THREE.Vector3(), _wMid = new THREE.Vector3(), _wIdx = new THREE.Vector3(), _wPnk = new THREE.Vector3();
+const _wB = new THREE.Quaternion(), _foreW = new THREE.Quaternion(), _qRel = new THREE.Quaternion();
+const _twist = new THREE.Quaternion(), _twDelta = new THREE.Quaternion(), _swing = new THREE.Quaternion();
+const _handLocal = new THREE.Quaternion(), _idQ = new THREE.Quaternion();
+function driveWrist(R, hand) {   // 手の向きを swing(曲げ)+twist(ひねり)に分解。ひねりは前腕へ、手首は曲げのみ＝グニャ回避
+  if (!R.handConst || !R.foreAxisLocal || !hand.a) return;
+  const dig = hand.d;
+  if (!dig[1] || !dig[2] || !dig[4]) return;
+  leapToThreeInto(hand.a.w, _wWrist);
+  leapToThreeInto(dig[2][1], _wMid);           // 中指付け根(MCP)
+  leapToThreeInto(dig[1][1], _wIdx);           // 人差し指付け根
+  leapToThreeInto(dig[4][1], _wPnk);           // 小指付け根
+  handBasisQ(_wWrist, _wMid, _wIdx, _wPnk, _wB);
+  _wB.multiply(R.handConst);                   // = 目標 hand world
+  // 1) ひねり(回内/回外)を前腕(lo)へ「比率分だけ」配分。残りは手ボーンが受ける＝肘ねじれと手首グニャを分け合う。
+  //    単一lo骨だとひねりは肘軸で起きる(ツイスト骨なし)ので、比率で前腕/手に薄く分散させるのが最善。
+  R.lo.updateWorldMatrix(true, false);
+  R.lo.getWorldQuaternion(_foreW);
+  _qRel.copy(_foreW).invert().multiply(_wB);            // 目標 hand を現・前腕ローカルへ
+  twistAbout(_qRel, R.foreAxisLocal, _twist);
+  _twDelta.copy(_twist).multiply(R.twist0Inv);          // twist·twist0⁻¹ = restからのひねり変化
+  if (CFG.leapForearmRoll < 1) _twDelta.slerp(_idQ, 1 - CFG.leapForearmRoll);   // 前腕の受け持ち分
+  R.lo.quaternion.multiply(_twDelta);                   // 前腕を自軸まわりにロール
+  R.lo.updateWorldMatrix(false, true);
+  // 2) 手ボーンは「ロール後の前腕基準で目標に達する残り全部」＝swing(曲げ) + 前腕が取らなかったひねり。
+  //    比率1なら残ひねり≈0(グニャ無し)、比率0なら全部ここ(肘は不動)。中立ではrestHdに一致。
+  R.lo.getWorldQuaternion(_foreW);
+  _handLocal.copy(_foreW).invert().multiply(_wB);
+  R.hd.quaternion.slerp(_handLocal, CFG.leapSmooth <= 0 ? 1 : CFG.leapSmooth);
+}
+function easeArmToRest(R) {   // 手ロスト/OFF: rest姿勢へ緩やか復帰
+  if (R.sh && R.restSh) R.sh.quaternion.slerp(R.restSh, 0.15);
+  R.up.quaternion.slerp(R.restUp, 0.15);
+  R.lo.quaternion.slerp(R.restLo, 0.15);
+  R.hd.quaternion.slerp(R.restHd, 0.15);
+  R.target.copy(R.restWrist);   // 再取得時に手首restから滑らかにEMA
+  R.upRoll = 0;
+}
+const _dgA = new THREE.Vector3(), _dgB = new THREE.Vector3(), _dgC = new THREE.Vector3();
+let armDiag = '';   // 診断: 駆動中の腕の実ワールド座標(肘が高い/腕が畳まれすぎ の切り分け)
+function driveArms(h) {
+  if (!armRest) armRest = captureArmRest(h);
+  const present = { left: false, right: false };
+  if (CFG.leapArms) {
+    for (const hand of leapHands) {
+      const side = handToSide(hand.s);
+      if (!armRest[side] || !hand.a) continue;
+      present[side] = true;
+      leapToThreeInto(hand.a.w, _armTgt);   // 手首位置を表示空間へ
+      const elb = hand.a.e ? leapToThreeInto(hand.a.e, _armElb) : null;   // Leap実肘(曲げ方向に使う)
+      solveArm(h, armRest[side], _armTgt, elb);
+      if (CFG.leapWrist) driveWrist(armRest[side], hand);   // 腕IKの後＝前腕が定まってから手首を向ける
+      const R = armRest[side];   // 診断: 肩/肘/手首の実Y＋腕の畳まれ具合(sh→wr距離 vs リーチ)
+      R.up.getWorldPosition(_dgA); R.lo.getWorldPosition(_dgB); R.hd.getWorldPosition(_dgC);
+      const reach = R.L1 + R.L2, d = _dgA.distanceTo(_dgC);
+      armDiag = `arm[${side[0]}] 肩Y=${_dgA.y.toFixed(2)} 肘Y=${_dgB.y.toFixed(2)} 手Y=${_dgC.y.toFixed(2)}`
+        + `  肘-手Δ=${(_dgB.y - _dgC.y).toFixed(2)}  肩→手=${d.toFixed(2)}/リーチ${reach.toFixed(2)}(畳${(1 - d / reach).toFixed(2)})`;
+    }
+  }
+  for (const side of ['left', 'right']) {   // 非駆動側(ロスト/OFF)は rest へ戻す
+    if (present[side] || !armRest[side]) continue;
+    easeArmToRest(armRest[side]);
+  }
+}
+
+// ==== Leap 指リターゲット (P2) ====
+//   各指ボーンを「rest時の子方向」→「Leap関節の prev→next 方向」へ aim する position ベース。
+//   位置(Leap→表示)は leapToThree で変換済み＝reflection(符号)混みでも正しく届くので、
+//   ボーンを実ワールド方向へ向けるだけで鏡映も一貫する(quat直変換の反射問題を回避)。
+//   計算は親フレームで: 子方向は親相対＝体の傾き(hips/spine駆動)に不変。P=親world quatを毎F取り直すので
+//   腕を上げるP3でも同式のまま通る。指チェーンは近位→遠位順に処理(親のworldを逐次更新)。
+const LEAP_FINGERS = [
+  { leap: 0, bones: ['ThumbMetacarpal','ThumbProximal','ThumbDistal'],   joints: [[1,2],[2,3],[3,4]] },
+  { leap: 1, bones: ['IndexProximal','IndexIntermediate','IndexDistal'], joints: [[1,2],[2,3],[3,4]] },
+  { leap: 2, bones: ['MiddleProximal','MiddleIntermediate','MiddleDistal'], joints: [[1,2],[2,3],[3,4]] },
+  { leap: 3, bones: ['RingProximal','RingIntermediate','RingDistal'],    joints: [[1,2],[2,3],[3,4]] },
+  { leap: 4, bones: ['LittleProximal','LittleIntermediate','LittleDistal'], joints: [[1,2],[2,3],[3,4]] },
+];
+let fingerRig = null;   // {left:[bone...], right:[bone...]}。null で次フレーム再取得(rest捕捉)
+function captureFingerRig(h) {
+  const sides = {};
+  const _w = new THREE.Vector3(), _cw = new THREE.Vector3(), _pw = new THREE.Vector3();
+  for (const side of ['left', 'right']) {
+    const bones = [];
+    for (const f of LEAP_FINGERS) {
+      for (let bi = 0; bi < f.bones.length; bi++) {
+        const node = h.getNormalizedBoneNode(side + f.bones[bi]);
+        if (!node || !node.parent) continue;                    // 欠損指はスキップ
+        const childName = (bi + 1 < f.bones.length) ? side + f.bones[bi + 1] : null;
+        const childNode = childName ? h.getNormalizedBoneNode(childName) : null;
+        node.updateWorldMatrix(true, false);
+        node.getWorldPosition(_w);
+        if (childNode) { childNode.updateWorldMatrix(true, false); childNode.getWorldPosition(_cw); }
+        else { node.parent.getWorldPosition(_pw); _cw.copy(_w).add(_w).sub(_pw); }  // 遠位=直線延長
+        const dirW = _cw.sub(_w).normalize();
+        const pInv = node.parent.getWorldQuaternion(new THREE.Quaternion()).invert();
+        bones.push({
+          node, parent: node.parent, leap: f.leap, ji: f.joints[bi],
+          restLocalQuat: node.quaternion.clone(),
+          restDirParent: dirW.applyQuaternion(pInv).normalize().clone(),
+        });
+      }
+    }
+    sides[side] = bones;
+  }
+  return sides;
+}
+function handToSide(s) {   // Leap手('l'/'r') → アバター側。mirror時は左右反転、合わなければ leapHandSwap
+  let avatarLeft = CFG.mirror ? (s === 'r') : (s === 'l');
+  if (CFG.leapHandSwap) avatarLeft = !avatarLeft;
+  return avatarLeft ? 'left' : 'right';
+}
+const _fA = new THREE.Vector3(), _fB = new THREE.Vector3(), _ftgt = new THREE.Vector3();
+const _fpq = new THREE.Quaternion(), _fqd = new THREE.Quaternion(), _ftq = new THREE.Quaternion();
+function driveFingers(h) {
+  if (!CFG.leapFingers) return;
+  if (!fingerRig) fingerRig = captureFingerRig(h);
+  const present = { left: false, right: false };
+  for (const hand of leapHands) {
+    const side = handToSide(hand.s);
+    present[side] = true;
+    const rig = fingerRig[side]; if (!rig) continue;
+    for (const b of rig) {
+      const dig = hand.d[b.leap]; if (!dig) continue;
+      leapToThreeInto(dig[b.ji[0]], _fA);
+      leapToThreeInto(dig[b.ji[1]], _fB);
+      _ftgt.copy(_fB).sub(_fA);
+      if (_ftgt.lengthSq() < 1e-9) continue;
+      b.parent.updateWorldMatrix(true, false);                // 近位→遠位順なので親は更新済みの姿勢
+      b.parent.getWorldQuaternion(_fpq);
+      _ftgt.applyQuaternion(_fpq.invert()).normalize();        // 目標方向を親フレームへ
+      _fqd.setFromUnitVectors(b.restDirParent, _ftgt);
+      _ftq.copy(_fqd).multiply(b.restLocalQuat);               // 目標ローカル = qΔ * restLocal
+      b.node.quaternion.slerp(_ftq, CFG.leapSmooth <= 0 ? 1 : CFG.leapSmooth);
+    }
+  }
+  for (const side of ['left', 'right']) {                      // 手ロスト側は rest へ緩やかに戻す
+    if (present[side] || !fingerRig[side]) continue;
+    for (const b of fingerRig[side]) b.node.quaternion.slerp(b.restLocalQuat, 0.2);
+  }
+}
+
+// キー操作は廃止(うっかり押下で設定が変わる事故防止)。全調整は右上の設定パネルに集約した。
+// 旧キー→パネル対応: 目線g/G/j/J/k/l→目線、b/i→体駆動/足IK、[/]→体倍率、x/y/t→体符号、
+//   h/H→髪collider、c→キャリブ、r→基準、R→脚rest。NECK_ANCHORの手動arrowはキャリブに一本化。
+
+// ---- loop ----
+const clock = new THREE.Clock();
+let hudT = 0;
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = clock.getDelta();
+  // ---- 首(neck)信号を先に計算（body駆動もドットも使う。update前に確定） ----
+  let nx = 0, ny = 0, nz = 0, haveNeck = false;
+  if (rootPos) {
+    if (!rootBase) rootBase = rootPos.slice();
+    const Rhead = boneRot.get('head');
+    const arm = _neckTmp.copy(NECK_ANCHOR);
+    if (Rhead) arm.applyQuaternion(Rhead);       // 表示用convertQuat済みの頭回転で相殺
+    nx = -(rootPos[0] - rootBase[0]) - arm.x;    // 表示向き(-x,+y,+z)でarmと同じ空間
+    ny =  (rootPos[1] - rootBase[1]) - arm.y;
+    nz =  (rootPos[2] - rootBase[2]) - arm.z;
+    if (!neckBase) neckBase = [nx, ny, nz];
+    haveNeck = true;
+    if (calib && Rhead) {                         // 自動キャリブ蓄積
+      _mtmp.makeRotationFromQuaternion(Rhead);
+      const e = _mtmp.elements;
+      calibAccum([e[0],e[4],e[8], e[1],e[5],e[9], e[2],e[6],e[10]],
+                 [-rootPos[0], rootPos[1], rootPos[2]]);
+    }
+  }
+
+  if (currentVRM) {
+    const h = currentVRM.humanoid;
+    for (const [tn, q] of boneRot) { const node = h.getNormalizedBoneNode(tn); if (node) node.quaternion.copy(q); }
+    const em = currentVRM.expressionManager;
+    if (em) {
+      const mouth = blendVal.get('A') || 0;                 // jawOpen(lip sync)
+      const suppress = Math.max(0, 1 - mouth * 3);          // 口が開いたら Angry/Surprised(口成分)を殺す
+      const EMO = new Set(['Angry', 'Sorrow', 'Surprised']);   // ※笑顔(Fun)は別処理・suppress対象外(喋っても笑顔維持)
+      // ウィンク(左右非対称のBlink_L/Rクリップ)。mirror時は setBone のワールドX鏡映でメッシュは非反転＝入替不要。
+      //   非mirror時のみ左右入替(旧CSS反転相当の見た目にする用)。
+      const SWAP = CFG.mirror ? {} : { 'Blink_L': 'Blink_R', 'Blink_R': 'Blink_L' };
+      const smileRaw = blendVal.get('Fun') || 0;
+      // 笑顔face(目+眉): smileMouth=true→複合(Fcl_ALL,口が開く旧型)/false→目+眉のみ(部位別)。
+      //   4種のうちアクティブ1つだけに値を入れ、残りは0で明示消去(切替時の残留で二重適用を防ぐ)。喋っても消さない。
+      const faceExpr = CFG.smileMouth ? resolveExpr(CFG.smileClip)
+                                      : exprMap.get('smile' + CFG.smileClip + 'face');
+      for (const nm of SMILE_FACE_EXPRS) if (nm) em.setValue(nm, nm === faceExpr ? smileRaw : 0);
+      // 笑顔の口(部位別のときだけ)。幅は smileWidth で bind.weight を可変。口開き(mouthopen)と共存→口を開けると🍉
+      const mouthExpr = exprMap.get('smilemouth');
+      if (mouthExpr) {
+        for (const b of smileMouthBinds) b.weight = CFG.smileWidth;
+        em.setValue(mouthExpr, CFG.smileMouth ? 0 : smileRaw);
+      }
+      // 口開き(顎)。既定 'aa' の代わりに Fcl_MTH_A を mouthGain で駆動＝開き具合を可変(1.0超で誇張)。'A' は下でスキップ
+      const openExpr = exprMap.get('mouthopen');
+      if (openExpr) {
+        for (const b of mouthOpenBinds) b.weight = CFG.mouthGain;
+        em.setValue(openExpr, blendVal.get('A') || 0);
+      }
+      // 瞬き/ウィンクはフル、Angry/Surprisedは口が開いたら抑制(笑顔Fun・口開きAは上で処理済み)
+      for (const [n, v] of blendVal) {
+        if (n === 'Fun') continue;
+        if (n === 'A' && openExpr) continue;   // mouthopenで駆動済み(openExpr無い時だけ既定'aa'にフォールバック)
+        const nm = SWAP[n] || n;
+        const a = resolveExpr(nm); if (!a) continue;
+        em.setValue(a, EMO.has(n) ? v * suppress : v);
+      }
+    }
+    // 首信号で上半身駆動（hips平行移動＋足ピンIK）。update前＝spring bone(髪/スカート)に効く
+    if (haveNeck) driveBody(h, nx - neckBase[0], ny - neckBase[1], nz - neckBase[2]);
+    driveArms(h);            // Leap 腕IK(P3)。body駆動の後＝更新後の肩から解く
+    driveFingers(h);         // Leap 指リターゲット(P2)。腕IKの後＝前に出た手を親に指を aim
+    currentVRM.update(dt);   // 正規化→raw転写 ＋ spring bone
+  }
+
+  // ---- ドット表示（黄=頭生 / シアン=neck推定） ----
+  if (haveNeck) {
+    // X:左右(CSS反転に合わせ-) / Y:上下そのまま / Z:奥行き
+    const map = (d) => [-d[0] * HEADDOT_GAIN, 1.45 + d[1] * HEADDOT_GAIN, d[2] * HEADDOT_GAIN];
+    headDot.position.set(...map([rootPos[0] - rootBase[0], rootPos[1] - rootBase[1], rootPos[2] - rootBase[2]]));
+    const G = HEADDOT_GAIN;
+    neckDot.position.set((nx - neckBase[0]) * G, 1.45 + (ny - neckBase[1]) * G, (nz - neckBase[2]) * G);
+  }
+  updateLeapDots();   // Leap 手/指 のデバッグ球(P1)
+  renderer.render(scene, camera);
+  if ((hudT += dt) > 0.5) {
+    hudT = 0;
+    const cinfo = calib ? `記録中 N=${calib.N}` : calibMsg;
+    const sgn = `${CFG.signX > 0 ? '+' : '-'}x ${CFG.signY > 0 ? '+' : '-'}y`;
+    // --- 診断: 届いてるblend値と目ボーンの状態（ウィンク/目線が来てるか一目で） ---
+    const blends = [...blendVal.entries()].map(([k, v]) => `${k}:${(+v).toFixed(2)}`).join(' ') || '(なし)';
+    setStatus(`ws: ${wsState}   黄=頭(生) / シアン=首(推定)   ※調整は右上の設定パネル`
+      + `\nbody:${CFG.bodyDrive ? 'ON' : 'OFF'}  IK:${CFG.ikEnabled ? 'ON' : 'OFF'}  gain×${CFG.gainMul.toFixed(1)}  符号 ${sgn}  髪collider r=${CFG.colliderR.toFixed(2)}  背景${CFG.bgTransparent ? '透過' : CFG.bgColor}`
+      + `\nblend: ${blends}`
+      + `\nleap: ${leapWsState}  手=${leapHands.length}${leapHands.length ? '(' + leapHands.map(h => h.s).join(',') + ')' : ''}`
+      + (armDiag ? `\n${armDiag}` : '')
+      + `\neye: 上下×${CFG.eyePitchGain.toFixed(2)} 左右×${CFG.eyeYawGain.toFixed(2)} 符号 上${CFG.eyePitchSign > 0 ? '+' : '-'} 左${CFG.eyeYawSign > 0 ? '+' : '-'} 笑顔=${CFG.smileClip}${CFG.smileMouth ? '/複合' : ''} 口角幅${CFG.smileWidth.toFixed(1)} 口開き${CFG.mouthGain.toFixed(1)} 閾${CFG.mouthThresh.toFixed(2)}`
+      + `\n${cinfo}`);
+  }
+}
+animate();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
