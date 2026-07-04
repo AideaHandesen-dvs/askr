@@ -2,7 +2,7 @@
 """生iFacialMocap(UDP:49985 テキスト) を WebSocket(:8201) でブラウザへ中継。
 
 VMC中継(vmc_ws_bridge.py)と違い、iFMの生テキスト(`key-val|...|=head#...|leftEye#...`)を
-そのまま流す。renderer側で全部parse・処理する＝VSFと同じ生データを直接使う本筋の構成。
+そのまま流す。renderer側で全部parse・処理する＝生データをそのまま使う本筋の構成。
 
   生iFM(UDP :49985) ──> [この橋] ──> WebSocket(:8201) ──> ブラウザ(renderer)
 

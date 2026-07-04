@@ -545,7 +545,7 @@ function convertEyeQuat(r, out) {
 }
 
 // ---- 生iFM(テキスト)を直接parseして boneRot/blendVal/rootPos を組む ----
-//   VMC加工を挟まず、VSFと同じ生データを処理する。表情計算は旧ブリッジの calc_* を移植。
+//   VMC加工を挟まず、生データを直接処理する。表情計算は旧ブリッジの calc_* を移植。
 //   これで削られてた情報(眼球回転・左右別Blink 等)が全部rendererに届く＝以降は全部ここで調整できる。
 const D2R = Math.PI / 180;
 const _ifmQ = new THREE.Quaternion(), _ifmE = new THREE.Euler();
@@ -605,7 +605,7 @@ function processRawIFM(text) {
   }
 }
 function connectWS() {
-  const ws = new WebSocket(`ws://${location.hostname}:8201`);   // 生iFM(VSFと同じ生データ)を直接処理
+  const ws = new WebSocket(`ws://${location.hostname}:8201`);   // 生iFM(生データ)を直接処理
   ws.onopen = () => { wsState = 'OK'; };
   ws.onclose = () => { wsState = 'closed, retry…'; setTimeout(connectWS, 1000); };
   ws.onerror = () => {};
@@ -800,7 +800,7 @@ function captureArmRest(h) {
   for (const side of ['left', 'right']) {
     const up = P(side + 'UpperArm'), lo = P(side + 'LowerArm'), hd = P(side + 'Hand');
     if (!up || !lo || !hd) { sides[side] = null; continue; }
-    const sh = P(side + 'Shoulder');   // 鎖骨。腕を上げると連動して開く(VSF流)。無いモデルはnull
+    const sh = P(side + 'Shoulder');   // 鎖骨。腕を上げると連動して開く。無いモデルはnull
     up.updateWorldMatrix(true, false);
     const wp = (n) => n.getWorldPosition(new THREE.Vector3());
     const shoulder = wp(up), elbow = wp(lo), wrist = wp(hd);
@@ -823,7 +823,7 @@ function captureArmRest(h) {
       .applyQuaternion(lo.getWorldQuaternion(new THREE.Quaternion()).invert()).normalize();
     const twist0 = twistAbout(hd.quaternion, foreAxisLocal, new THREE.Quaternion());
     const twist0Inv = twist0.clone().invert();
-    // 上腕の長軸(肩→肘)を up-ローカルで＝ひねり分散の軸。ここに回内/回外の一部を逃がす(VSF流・肘軸で不動)
+    // 上腕の長軸(肩→肘)を up-ローカルで＝ひねり分散の軸。ここに回内/回外の一部を逃がす(肘軸で不動)
     const upAxisLocal = elbow.clone().sub(shoulder).normalize()
       .applyQuaternion(up.getWorldQuaternion(new THREE.Quaternion()).invert()).normalize();
     sides[side] = { up, lo, hd, sh, restSh: sh ? sh.quaternion.clone() : null,   // 肩(鎖骨)とそのrest
