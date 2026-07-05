@@ -4,5 +4,6 @@ __pycache__/
 renderer/.venv/
 renderer/config.json
 renderer/assets/*.vrm
+!renderer/assets/model.vrm
 *.bak*
 leap_capture.txt

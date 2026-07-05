@@ -1,0 +1,26 @@
+Sample avatar model  —  renderer/assets/model.vrm
+==================================================
+
+Copyright (c) 2026 handesen
+
+This sample VRM is bundled ONLY as a ready-to-run test avatar for Askr.
+It is licensed SEPARATELY from the Askr source code (the code is MIT; this
+model is NOT MIT).
+
+Terms (from the model's embedded VRM license metadata):
+
+  Use by anyone (avatar use) .......... ALLOWED
+  Download ............................ ALLOWED
+  Redistribution ...................... ALLOWED
+  Credit ("handesen") ................. REQUIRED
+  Commercial use (personal & corporate) PROHIBITED
+  Modification ........................ PROHIBITED
+  Sexual / violent expression ......... PROHIBITED
+
+Authoritative terms (VRoid license URL, also embedded in the .vrm):
+
+  https://hub.vroid.com/license?allowed_to_use_user=everyone&characterization_allowed_user=everyone&corporate_commercial_use=disallow&credit=necessary&modification=disallow&personal_commercial_use=disallow&redistribution=allow&sexual_expression=disallow&version=1&violent_expression=disallow
+
+The metadata embedded in model.vrm is authoritative; this file only
+summarizes it. If you replace model.vrm with your own avatar, this file
+does not apply to your model.

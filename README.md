@@ -56,14 +56,17 @@
 cd renderer
 python3 -m venv .venv && . .venv/bin/activate
 pip install websockets python-osc          # python-osc は VMC 中継を使う場合のみ
-# VRM を置く（自分の VRoid 等）。同梱はしていない
-cp /path/to/your.vrm assets/model.vrm       # または URL の ?vrm=... で指定
+# サンプル VRM 同梱済み（assets/model.vrm）＝clone してそのまま動く
+# 自分の VRoid 等に差し替えるなら:
+#   cp /path/to/your.vrm assets/model.vrm    # または URL の ?vrm=... で指定
 python config_server.py                      # :8199
 python raw_ifm_ws_bridge.py                  # :8201  (顔を使うなら)
 python leap_raw_ws_bridge.py                 # :8202  (手を使うなら)
 ```
 
 ブラウザで `http://<レンダーホスト>:8199` を開く。調整用は素の URL（診断表示あり）。
+
+> 同梱サンプル VRM `renderer/assets/model.vrm` は **© handesen**。再配布可・**要クレジット**・非商用・改変不可（コードの MIT とは別ライセンス）。詳細は [`renderer/assets/MODEL_LICENSE.txt`](renderer/assets/MODEL_LICENSE.txt)。
 
 ### 撮影PC
 
