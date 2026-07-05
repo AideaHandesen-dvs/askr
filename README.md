@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/askr-card.jpg" alt="Askr — ブラウザで動く VTuber レンダラ。顔＋指トラッキング → VRM、VMC 互換。" width="100%">
+</p>
+
 # Askr
 
 **ブラウザで動く、いじれる VTuber レンダラ。** 顔（iFacialMocap）と手/腕（Ultraleap Gemini）の
