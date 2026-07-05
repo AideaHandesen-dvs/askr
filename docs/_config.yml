@@ -1,0 +1,5 @@
+title: Askr
+description: "ブラウザで動く、いじれる VTuber レンダラ — 顔＋指トラッキングで VRM を動かす"
+theme: jekyll-theme-cayman
+plugins:
+  - jekyll-seo-tag
