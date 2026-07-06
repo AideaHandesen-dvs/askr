@@ -128,6 +128,7 @@ function saveCfg() {                   // 連続操作(スライダー等)をま
 }
 async function loadCfg() {
   try { const r = await fetch('/config'); if (r.ok) Object.assign(CFG, await r.json()); } catch {}
+  if (new URLSearchParams(location.search).get('bg') === 'transparent') CFG.bgTransparent = true;   // OBS用: URLで透過を強制(共有config非依存・自動配信の?bg=transparentと同流儀)
   if (Array.isArray(CFG.neckAnchor)) NECK_ANCHOR.fromArray(CFG.neckAnchor);   // 保存済みキャリブを復元
   if (typeof controls !== 'undefined') applyCamSlot(0);   // 起動時はスロット1の画角を復元
   refreshPanel(); applySideEffects(); applyArmRestPose();
