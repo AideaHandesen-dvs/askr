@@ -2,11 +2,11 @@
   <img src="docs/askr-card.jpg" alt="Askr — ブラウザで動く VTuber レンダラ。顔＋指トラッキング → VRM、VMC 互換。" width="100%">
 </p>
 
-# Askr
+# <img src="docs/logo_mark.png" alt="" height="34" align="top"> Askr
 
 **ブラウザで動く、いじれる VTuber レンダラ。** 顔（iFacialMocap）と手/腕（Ultraleap Gemini）の
 トラッキングを取り込み、[three-vrm](https://github.com/pixiv/three-vrm) で VRM アバターをブラウザ上に
-描画する。VMC 互換。出力は OBS（ブラウザソース・背景透過）経由で NDI へ。
+描画する。VMC 互換。出力は OBS のブラウザソース（背景透過）でそのまま取り込める。
 
 ![Askr デモ — 顔と手/指のリアルタイムトラッキングで VRM を動かす（開発UI→クリーン）](docs/askr-demo.gif)
 
@@ -36,7 +36,7 @@
                                            │   http://<host>:8199   WS:8201(顔)/8202(手)受信 │
                                            └───────────────────────┬────────────────────────┘
                                                                     ▼
-                                        OBS ブラウザソース (?clean=1, 背景透過α) ──NDI──▶ 配信/合成
+                                        OBS ブラウザソース (?clean=1, 背景透過α) ──▶ 配信/合成
 ```
 
 顔と手は独立した経路。撮影PC で VRM の rest pose を持たないため、Leap のリターゲット（関節 → VRM 指/腕
@@ -88,12 +88,12 @@ Leap は現行 Gemini（LeapC）を隔離 Python 3.12 から叩く。手順は
 python sender\ifm_forward.py --host <レンダーホスト>
 ```
 
-## OBS / NDI
+## OBS（ブラウザソースで直接取り込む）
 
 - OBS の**ブラウザソース**に `http://<レンダーホスト>:8199/?clean=1` を指定
   - `?clean=1` で HUD・診断ドット・Leap デバッグ球を**全消し**（＝アバターだけのクリーン映像）
   - 背景透過は renderer が α 対応。OBS ブラウザソースのアルファでそのまま抜ける（クロマキー不要）
-- あとは OBS の NDI 出力（DistroAV / obs-ndi 等）で配信・合成先へ
+- これで OBS に取り込めた＝あとは普段どおり配信・録画・合成すればいい（NDI 等の配信手段は各自の環境次第。Askr は OBS のブラウザソースまでで完結）
 
 ## 操作
 
