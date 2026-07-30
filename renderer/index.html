@@ -82,7 +82,8 @@ const TURN_GAIN = 0.3, TURN_MAX = 0.2;  // 頭傾げ(roll)→胴ヨー[rad]。�
 //   目線ゲインは眼球±15°→白目回避で圧縮。実機で合わせた値はブラウザに残りリロードで復活する。
 const CFG_DEFAULTS = {
   eyePitchGain: 0.2, eyeYawGain: 0.4, eyePitchSign: 1, eyeYawSign: 1,
-  smileClip: 'fun', smileMouth: false, smileWidth: 1.3, smileGain: 1.0, mouthGain: 1.3, mouthThresh: 0.2,
+  smileClip: 'fun', smileMouth: false, smileWidth: 1.3, smileGain: 1.0, mouthGain: 1.3, mouthThresh: 0.2, tongueGain: 1.0,
+  tongueY: -0.14, tongueZ: 0.05, tongueSize: 1.0,   // 舌メッシュ: head骨からのY下げ/Z前出し/全体サイズ
   // 体駆動(旧キー操作を設定化)：うっかりキー押下で変わらないよう全部パネル/保存に集約
   mirror: true,   // 左右ミラー(鏡モード)。データ側で動きだけ鏡映＝メッシュ(アホ毛/非対称)は反転しない
   bodyDrive: true, ikEnabled: true, gainMul: 1.0, signX: 1, signY: 1, signT: -1, colliderR: 0.09,
@@ -166,6 +167,10 @@ const PANEL = [
   { k: 'smileGain',    label: '笑顔 強さ', type: 'range', min: 0, max: 2, step: 0.1 },
   { k: 'mouthGain',    label: '口 開き',   type: 'range', min: 0, max: 2.5, step: 0.1 },
   { k: 'mouthThresh',  label: '開き閾値',  type: 'range', min: 0, max: 0.6, step: 0.02 },
+  { k: 'tongueGain',   label: '舌 強さ',   type: 'range', min: 0, max: 2, step: 0.1 },
+  { k: 'tongueY',      label: '舌 高さ',   type: 'range', min: -0.25, max: 0, step: 0.01 },
+  { k: 'tongueZ',      label: '舌 前後',   type: 'range', min: 0, max: 0.15, step: 0.01 },
+  { k: 'tongueSize',   label: '舌 サイズ', type: 'range', min: 0.3, max: 2, step: 0.1 },
   { sep: '体・首' },
   { k: 'mirror',       label: '左右ミラー', type: 'bool' },
   { k: 'bodyDrive',    label: '体駆動',    type: 'bool' },
@@ -395,6 +400,7 @@ const EXPR_ALIAS = {
   sorrow: ['sorrow', 'sad'], surprised: ['surprised'], neutral: ['neutral'],
   blink: ['blink'], blink_l: ['blinkleft', 'blink_l'], blink_r: ['blinkright', 'blink_r'],
   a: ['aa', 'a'], i: ['ih', 'i'], u: ['ou', 'u'], e: ['ee', 'e'], o: ['oh', 'o'],
+  tongueout: ['tongueout', 'tongue'],
 };
 const exprMap = new Map();   // lowercased -> 実名
 function resolveExpr(vmcName) {
@@ -498,6 +504,35 @@ loader.load(
         registerExpr('smilemouth', (e) => addMorphBinds(e, 'Fcl_MTH_Fun', CFG.smileWidth, smileMouthBinds));
       if ('Fcl_MTH_A' in faceMesh.morphTargetDictionary)             // 口開き(顎)。既定 'aa' の代わりに使い、開き具合を可変に
         registerExpr('mouthopen', (e) => addMorphBinds(e, 'Fcl_MTH_A', CFG.mouthGain, mouthOpenBinds));
+      // 舌出し(tongueOut)。モデル側に舌morph(Fcl_MTH_TongueOut等)があれば自動バインド、無ければ何もしない
+      const tongueBinds = [];
+      const tongueMorphName = (() => {
+        for (const key in faceMesh.morphTargetDictionary) {
+          if (/tongue/i.test(key)) return key;
+        }
+        return null;
+      })();
+      if (tongueMorphName) {
+        registerExpr('tongueout', (e) => addMorphBinds(e, tongueMorphName, CFG.tongueGain, tongueBinds));
+        console.log(`[tongue] 舌morph発見: ${tongueMorphName}, expression 'tongueout' を登録`);
+      }
+      // 舌bindのweightをライブ調整できるようグローバルに保持
+      window._tongueBinds = tongueBinds;
+      // 舌morphがモデルに無い場合: head骨に舌メッシュを生やしてフォールバック
+      window._tongueMesh = null;
+      if (!tongueMorphName) {
+        const headNode = vrm.humanoid.getNormalizedBoneNode('head');
+        if (headNode) {
+          const tongueGeo = new THREE.BoxGeometry(0.03, 0.01, 0.06);
+          const tongueMat = new THREE.MeshStandardMaterial({ color: 0xf06070, roughness: 0.35, metalness: 0 });
+          const mesh = new THREE.Mesh(tongueGeo, tongueMat);
+          mesh.visible = false;
+          mesh.renderOrder = 1;
+          headNode.add(mesh);
+          window._tongueMesh = mesh;
+          console.log('[tongue] 舌morph未検出 → head骨に舌メッシュを追加（フォールバック）');
+        }
+      }
       // 笑顔face実名(重複除去)。複合(fun/joy)は VRM0→1 で relaxed/happy 等に化けるため resolveExpr で解決
       SMILE_FACE_EXPRS = [resolveExpr('fun'), resolveExpr('joy'),
                           exprMap.get('smilefunface'), exprMap.get('smilejoyface')]
@@ -591,6 +626,7 @@ function processRawIFM(text) {
   blendVal.set('Blink_R', clamp01(ifmVal(text, 'eyeBlink_R') / 100));
   const jo = ifmVal(text, 'jawOpen') / 100;
   blendVal.set('A', clamp01((jo - CFG.mouthThresh) / Math.max(0.01, 1 - CFG.mouthThresh)));
+  blendVal.set('TongueOut', clamp01(ifmVal(text, 'tongueOut') / 100));
   // 頭(rot deg + pos)
   const h = ifmVec(text, '=head#');
   if (h && h.length >= 6) {
@@ -1129,13 +1165,33 @@ function animate() {
         for (const b of mouthOpenBinds) b.weight = CFG.mouthGain;
         em.setValue(openExpr, blendVal.get('A') || 0);
       }
+      // 舌出し(tongueOut)。bind.weight を tongueGain でライブ調整
+      const tongueExpr = exprMap.get('tongueout');
+      if (tongueExpr) {
+        if (window._tongueBinds) for (const b of window._tongueBinds) b.weight = CFG.tongueGain;
+        em.setValue(tongueExpr, blendVal.get('TongueOut') || 0);
+      }
       // 瞬き/ウィンクはフル、Angry/Surprisedは口が開いたら抑制(笑顔Fun・口開きAは上で処理済み)
       for (const [n, v] of blendVal) {
         if (n === 'Fun') continue;
         if (n === 'A' && openExpr) continue;   // mouthopenで駆動済み(openExpr無い時だけ既定'aa'にフォールバック)
+        if (n === 'TongueOut' && tongueExpr) continue;   // tongueoutで駆動済み
         const nm = SWAP[n] || n;
         const a = resolveExpr(nm); if (!a) continue;
         em.setValue(a, EMO.has(n) ? v * suppress : v);
+      }
+    }
+    // 舌メッシュ フォールバック駆動（モデルに舌morphが無い場合、head骨に生やしたメッシュを動かす）
+    const tongueMesh = window._tongueMesh;
+    if (tongueMesh) {
+      const tv = (blendVal.get('TongueOut') || 0) * CFG.tongueGain;
+      if (tv > 0.01) {
+        tongueMesh.visible = true;
+        const s = CFG.tongueSize;
+        tongueMesh.scale.set(s, s * 0.4, s * (1 + tv * 1.5));
+        tongueMesh.position.set(0, CFG.tongueY, CFG.tongueZ + tv * 0.03 * s);
+      } else {
+        tongueMesh.visible = false;
       }
     }
     // 首信号で上半身駆動（hips平行移動＋足ピンIK）。update前＝spring bone(髪/スカート)に効く
