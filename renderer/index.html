@@ -147,6 +147,7 @@ function applySideEffects() {
   }
   for (const s of bodyColliderShapes) s.radius = CFG.colliderR;
   if (window._tongueMat && window._tongueMat.color) window._tongueMat.color.set(CFG.tongueColor);   // 舌色(パネルでライブ変更)
+  if (window._tongueMesh) window._tongueMesh.visible = CFG.tongueEnable;                            // 舌OFFで完全非表示(口を開けても出ない)
 }
 const bodyColliderShapes = [];   // 追加したカプセルshape(半径は CFG.colliderR でライブ調整)
 
@@ -508,11 +509,12 @@ loader.load(
       //   舌が別メッシュ(tools/vrm_add_tongue.py で焼いた Tongue メッシュ)でも addMorphBinds が全メッシュ走査で拾う。
       //   舌morphが無ければ何もしない＝箱を生やす旧フォールバックは廃止(舌はVRM側に持たせる方針)。
       let tongueMorph = null;
-      window._tongueMat = null;
+      window._tongueMat = null; window._tongueMesh = null;
       vrm.scene.traverse((o) => {
         if (tongueMorph || !o.isMesh || !o.morphTargetDictionary) return;
         for (const key in o.morphTargetDictionary) if (/tongue/i.test(key)) {
           tongueMorph = key;
+          window._tongueMesh = o;                                                        // 舌OFFで非表示にするため保持
           window._tongueMat = Array.isArray(o.material) ? o.material[0] : o.material;   // 舌色をライブ変更するため保持
           break;
         }
@@ -520,6 +522,7 @@ loader.load(
       if (tongueMorph) {
         registerExpr('tongueout', (e) => addMorphBinds(e, tongueMorph, CFG.tongueGain, tongueBinds));
         if (window._tongueMat && window._tongueMat.color) window._tongueMat.color.set(CFG.tongueColor);   // 保存色を即反映
+        if (window._tongueMesh) window._tongueMesh.visible = CFG.tongueEnable;                            // 保存ON/OFFを即反映
         console.log(`[tongue] 舌morph発見: ${tongueMorph} → expression 'tongueout' 登録`);
       }
       // 笑顔face実名(重複除去)。複合(fun/joy)は VRM0→1 で relaxed/happy 等に化けるため resolveExpr で解決
