@@ -131,7 +131,8 @@ async function loadCfg() {
   try { const r = await fetch('/config'); if (r.ok) Object.assign(CFG, await r.json()); } catch {}
   if (new URLSearchParams(location.search).get('bg') === 'transparent') CFG.bgTransparent = true;   // OBS用: URLで透過を強制(共有config非依存・自動配信の?bg=transparentと同流儀)
   if (Array.isArray(CFG.neckAnchor)) NECK_ANCHOR.fromArray(CFG.neckAnchor);   // 保存済みキャリブを復元
-  if (typeof controls !== 'undefined') applyCamSlot(0);   // 起動時はスロット1の画角を復元
+  const _camN = parseInt(new URLSearchParams(location.search).get('cam'), 10);   // OBS用: ?cam=N で起動画角のスロットを選択(既定=1・?bg/?cleanと同流儀)
+  if (typeof controls !== 'undefined') applyCamSlot(Number.isInteger(_camN) ? _camN - 1 : 0);   // 起動時はスロットの画角を復元(既定スロット1)
   refreshPanel(); applySideEffects(); applyArmRestPose();
 }
 // CFG → 描画側へ即反映(背景・collider半径)。パネル変更/起動/設定読込後に呼ぶ。renderer生成後のみ呼ぶこと
