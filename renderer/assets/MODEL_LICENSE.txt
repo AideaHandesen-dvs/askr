@@ -7,6 +7,10 @@ This sample VRM is bundled ONLY as a ready-to-run test avatar for Askr.
 It is licensed SEPARATELY from the Askr source code (the code is MIT; this
 model is NOT MIT).
 
+This bundled build additionally includes a tongue mesh + `Tongue` morph
+baked in by the author (tools/vrm_add_tongue.py) so iFacialMocap tongueOut
+drives the tongue out of the box.
+
 Terms (from the model's embedded VRM license metadata):
 
   Use by anyone (avatar use) .......... ALLOWED
@@ -14,12 +18,12 @@ Terms (from the model's embedded VRM license metadata):
   Redistribution ...................... ALLOWED
   Credit ("handesen") ................. REQUIRED
   Commercial use (personal & corporate) PROHIBITED
-  Modification ........................ PROHIBITED
+  Modification ........................ ALLOWED
   Sexual / violent expression ......... PROHIBITED
 
 Authoritative terms (VRoid license URL, also embedded in the .vrm):
 
-  https://hub.vroid.com/license?allowed_to_use_user=everyone&characterization_allowed_user=everyone&corporate_commercial_use=disallow&credit=necessary&modification=disallow&personal_commercial_use=disallow&redistribution=allow&sexual_expression=disallow&version=1&violent_expression=disallow
+  https://hub.vroid.com/license?allowed_to_use_user=everyone&characterization_allowed_user=everyone&corporate_commercial_use=disallow&credit=necessary&modification=allow&personal_commercial_use=disallow&redistribution=allow&sexual_expression=disallow&version=1&violent_expression=disallow
 
 The metadata embedded in model.vrm is authoritative; this file only
 summarizes it. If you replace model.vrm with your own avatar, this file

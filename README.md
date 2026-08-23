@@ -64,9 +64,10 @@
 cd renderer
 python3 -m venv .venv && . .venv/bin/activate
 pip install websockets python-osc          # python-osc は VMC 中継を使う場合のみ
-# サンプル VRM 同梱済み（assets/model.vrm）＝clone してそのまま動く
+# サンプル VRM 同梱済み（assets/model.vrm・舌焼き込み済みで clone してそのまま舌も動く）
 # 自分の VRoid 等に差し替えるなら:
 #   cp /path/to/your.vrm assets/model.vrm    # または URL の ?vrm=... で指定
+#   自分のモデルに舌を足すなら: python tools/vrm_add_tongue.py in.vrm out.vrm
 python config_server.py                      # :8199
 python raw_ifm_ws_bridge.py                  # :8201  (顔を使うなら)
 python leap_raw_ws_bridge.py                 # :8202  (手を使うなら)
@@ -74,7 +75,7 @@ python leap_raw_ws_bridge.py                 # :8202  (手を使うなら)
 
 ブラウザで `http://<レンダーホスト>:8199` を開く。調整用は素の URL（診断表示あり）。
 
-> 同梱サンプル VRM `renderer/assets/model.vrm` は **© handesen**。再配布可・**要クレジット**・非商用・改変不可（コードの MIT とは別ライセンス）。詳細は [`renderer/assets/MODEL_LICENSE.txt`](renderer/assets/MODEL_LICENSE.txt)。
+> 同梱サンプル VRM `renderer/assets/model.vrm` は **© handesen**。再配布可・**要クレジット**・非商用・改変可（コードの MIT とは別ライセンス）。詳細は [`renderer/assets/MODEL_LICENSE.txt`](renderer/assets/MODEL_LICENSE.txt)。
 
 ### 撮影PC
 
@@ -125,11 +126,13 @@ tracker/make_cert.sh        # 自己署名証明書(SAN に LAN IP と、この 
 ### 舌（tongueOut）
 
 renderer は morph 名に `tongue` を含むモーフを見つけると自動で expression `tongueout` に繋ぐ。
-VRoid 系の VRM は**舌ジオメトリを持たない**ので、動かす対象が無い場合は付属ツールで焼き込む：
+同梱の `renderer/assets/model.vrm` は舌を焼き込み済みなので、そのまま動く。
+自分の VRoid 系 VRM は**舌ジオメトリを持たない**ので、付属ツールで焼き込む：
 
 ```bash
-python tools/vrm_add_tongue.py renderer/assets/model.vrm renderer/assets/model_tongue.vrm
+python tools/vrm_add_tongue.py your_avatar.vrm your_avatar_tongue.vrm
 # ※ numpy が要る。元ファイルは書き換えず別ファイルへ出力する
+# ※ 既に舌を持つモデル（同梱 model.vrm など）を与えると二重舌防止で中止する
 ```
 
 舌の値そのものは **iPhone の ARKit（`tongueOut`）が確実**（校正不要）。ブラウザ版トラッカーは
@@ -162,7 +165,8 @@ MediaPipe が `tongueOut` を返さない（舌を出した写真で測っても
 
 ## 操作
 
-- 全調整は**右上のパネル**（目線・表情・体駆動・Leap の腕/手/指・カメラ・背景）。変更は `config.json` に保存
+- 全調整は**右上のパネル**（目線・表情・舌・体駆動・Leap の腕/手/指・カメラ・背景）。変更は `config.json` に保存
+  - **舌**：tongueOut（iFacialMocap／ブラウザ版トラッカーの自前推定）で駆動。パネルで ON/OFF・強さ・色を調整（OFF で舌メッシュを完全非表示）
 - **キー 1–4**：カメラ視点スロットの呼び出し（パネルで保存、起動時はスロット 1 を復元＝URL の `?cam=N` で変更可）
 - **Space**：診断表示（HUD/ドット）のトグル
 

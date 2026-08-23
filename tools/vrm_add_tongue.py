@@ -12,13 +12,18 @@ VRoid 等の VRM は舌ジオメトリを持たないため、iFacialMocap の t
 元モデルは書き換えず別ファイルへ出力する。renderer 側は morph 名に "tongue" を
 含むモーフを自動で拾って expression 'tongueout' にバインドする(index.html)。
 
-使い方:
-  python tools/vrm_add_tongue.py renderer/assets/model.vrm renderer/assets/model_tongue.vrm
+使い方(自分の舌無しVRoid等に舌を足す):
+  python tools/vrm_add_tongue.py your_avatar.vrm your_avatar_tongue.vrm
   # 形/位置の微調整は下の TUNE 定数、または実行時の renderer 側 "舌 強さ" スライダーで。
   # ※ numpy が要る。renderer/.venv には入っていないので、numpy のある python で実行すること。
 
 前提(満たさないと SystemExit で止まる): Fcl_* モーフを持つ顔メッシュ(=VRoid系VRM)、
 口の位置を測る FaceMouth 系マテリアル、humanoid の head 骨が顔スキンの joints に居ること。
+
+注: 同梱 renderer/assets/model.vrm は既に舌を焼き込み済み。これを入力に与えると
+   二重舌になるため has_tongue() ガードが検知して中止する。素の(舌無し)版が要る
+   なら git 履歴の焼き込み前コミットから取り出すこと:
+     git show <焼込み前commit>:renderer/assets/model.vrm > base.vrm
 """
 import json
 import struct
@@ -214,10 +219,30 @@ def build_tongue(mouth_min, mouth_max, T):
     return P, N, D, T.ravel()
 
 
+def has_tongue(J):
+    """既に舌(Tongueモーフ/メッシュ)を持つVRMか。二重焼き込み防止用。"""
+    for m in J.get("meshes", []):
+        if "tongue" in (m.get("name", "") or "").lower():
+            return True
+        names = (m.get("extras") or {}).get("targetNames") or []
+        if any("tongue" in str(x).lower() for x in names):
+            return True
+        for pr in m.get("primitives", []):
+            pn = (pr.get("extras") or {}).get("targetNames") or []
+            if any("tongue" in str(x).lower() for x in pn):
+                return True
+    return False
+
+
 def main():
     src = sys.argv[1] if len(sys.argv) > 1 else "renderer/assets/model.vrm"
     dst = sys.argv[2] if len(sys.argv) > 2 else "renderer/assets/model_tongue.vrm"
     J, BIN = read_glb(src)
+
+    if has_tongue(J):
+        raise SystemExit(
+            f"中止: '{src}' は既に舌(Tongueモーフ/メッシュ)を持っている＝二重舌になる。\n"
+            f"舌無しモデルを入力に指定するか、同梱舌を焼き直すなら git 履歴の焼込み前版を使うこと。")
 
     face_mi = find_face_mesh(J)
     prim = find_mouth_material_prim(J, face_mi)
