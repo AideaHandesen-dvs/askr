@@ -148,7 +148,6 @@ function applySideEffects() {
   }
   for (const s of bodyColliderShapes) s.radius = CFG.colliderR;
   if (window._tongueMat && window._tongueMat.color) window._tongueMat.color.set(CFG.tongueColor);   // 舌色(パネルでライブ変更)
-  if (window._tongueMesh) window._tongueMesh.visible = CFG.tongueEnable;                            // 舌OFFで完全非表示(口を開けても出ない)
 }
 const bodyColliderShapes = [];   // 追加したカプセルshape(半径は CFG.colliderR でライブ調整)
 
@@ -452,7 +451,7 @@ function addBodyColliders(vrm) {
 
 loadInfo = 'loading VRM…'; setStatus();
 loader.load(
-  new URLSearchParams(location.search).get('vrm') || 'assets/model.vrm',
+  new URLSearchParams(location.search).get('vrm') || 'assets/model.vrm',   // 既定は同梱のサンプルVRM。?vrm=… で差し替え
   (gltf) => {
     const vrm = gltf.userData.vrm;
     VRMUtils.removeUnnecessaryVertices(gltf.scene);
@@ -510,12 +509,11 @@ loader.load(
       //   舌が別メッシュ(tools/vrm_add_tongue.py で焼いた Tongue メッシュ)でも addMorphBinds が全メッシュ走査で拾う。
       //   舌morphが無ければ何もしない＝箱を生やす旧フォールバックは廃止(舌はVRM側に持たせる方針)。
       let tongueMorph = null;
-      window._tongueMat = null; window._tongueMesh = null;
+      window._tongueMat = null;
       vrm.scene.traverse((o) => {
         if (tongueMorph || !o.isMesh || !o.morphTargetDictionary) return;
         for (const key in o.morphTargetDictionary) if (/tongue/i.test(key)) {
           tongueMorph = key;
-          window._tongueMesh = o;                                                        // 舌OFFで非表示にするため保持
           window._tongueMat = Array.isArray(o.material) ? o.material[0] : o.material;   // 舌色をライブ変更するため保持
           break;
         }
@@ -523,7 +521,6 @@ loader.load(
       if (tongueMorph) {
         registerExpr('tongueout', (e) => addMorphBinds(e, tongueMorph, CFG.tongueGain, tongueBinds));
         if (window._tongueMat && window._tongueMat.color) window._tongueMat.color.set(CFG.tongueColor);   // 保存色を即反映
-        if (window._tongueMesh) window._tongueMesh.visible = CFG.tongueEnable;                            // 保存ON/OFFを即反映
         console.log(`[tongue] 舌morph発見: ${tongueMorph} → expression 'tongueout' 登録`);
       }
       // 笑顔face実名(重複除去)。複合(fun/joy)は VRM0→1 で relaxed/happy 等に化けるため resolveExpr で解決
@@ -603,7 +600,68 @@ function setBone(tn, r, eye) {
   //   カメラ正面固定(画面X=ワールドX)なので旧見た目を完全再現しつつアホ毛等の非対称メッシュだけ正しくなる。
   if (CFG.mirror) q.set(q.x, -q.y, -q.z, q.w);
 }
+// MeowFace(Android)等が送るVTubeStudio系JSONを、iFMパイプ形式へ変換して既存処理に合流させる。
+//   {"Rotation":{x,y,z}deg,"Position":{x,y,z},"EyeLeft/Right":{x,y,z},"BlendShapes":[{"k":ARKit名,"v":0..1}]}
+//   → iFMは 'key-値(0..100)|...|=head#rx,ry,rz,px,py,pz|leftEye#rx,ry|rightEye#rx,ry'。ARKit camel名を _L/_R へ、v(0..1)を×100。
+// MeowFaceの頭回転は中立が0でなく、スマホ設置角ぶんのオフセット(実測でpitch≈75〜90°)を含む。
+//   convertQuatはiFM前提で中立0°を想定するため、大オフセットのままだとX(ピッチ)がY(ヨー)へ漏れて
+//   「下向き→左向き」に化ける。初回の顔検出フレームを中立として引き、0基準へ正規化する。
+let meowNeutral = null;
+window.meowZero = () => { meowNeutral = null; console.log('[meow] 次フレームを新しい中立に取り直す。正面を向いて'); };  // consoleで正面向いて呼ぶと中立再取得
+// 画面に生の頭回転を出すデバッグHUD。console で meowDebug() ON / meowDebug(false) OFF。
+window._meowDbg = false;
+window.meowDebug = (on = true) => {
+  window._meowDbg = on;
+  let el = document.getElementById('meowdbg');
+  if (on && !el) {
+    el = document.createElement('div'); el.id = 'meowdbg';
+    el.style.cssText = 'position:fixed;top:8px;left:8px;z-index:99999;background:rgba(0,0,0,.75);color:#0f0;font:13px/1.5 monospace;padding:8px 10px;white-space:pre;pointer-events:none;border-radius:4px';
+    document.body.appendChild(el);
+  }
+  if (el) el.style.display = on ? 'block' : 'none';
+  console.log('[meow] デバッグHUD', on ? 'ON — 下や横を向くと動く軸が分かる' : 'OFF');
+};
+// 頭の軸マッピングをその場で総当たり切替。console で meowAxis() を押すたびに次の組合せへ。
+//   下を向いてアバターも下向くまで押すだけ(全6通り網羅)。左右反転はパネルの signX/signY/signT で。
+const MEOW_PERMS = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
+window._meowAxisI = 3;   // 実機で確定: [1,2,0] がMeowFace(この設置)の頭軸。違う設置なら meowAxis() で取り直す
+window.meowAxis = () => {
+  window._meowAxisI = (window._meowAxisI + 1) % MEOW_PERMS.length;
+  console.log(`[meow] 頭軸マッピング #${window._meowAxisI} = ${JSON.stringify(MEOW_PERMS[window._meowAxisI])} — 下を向いて確認。違えばもう一度 meowAxis()`);
+};
+function meowJsonToIFM(json) {
+  const d = JSON.parse(json);
+  const bs = {};
+  if (Array.isArray(d.BlendShapes)) for (const b of d.BlendShapes) bs[b.k] = b.v;
+  const g = (k) => (bs[k] || 0) * 100;   // 0..1 → 0..100 (既存パーサは/100や/300で使うため)
+  const R = d.Rotation || { x: 0, y: 0, z: 0 };
+  if (!meowNeutral && d.FaceFound) meowNeutral = { x: R.x, y: R.y, z: R.z };   // 正面中立を自動キャプチャ
+  const n = meowNeutral || { x: 0, y: 0, z: 0 };
+  const r = { x: R.x - n.x, y: R.y - n.y, z: R.z - n.z };   // 中立を0にオフセット除去
+  if (window._meowDbg) {   // 画面HUD: 生値と中立差を出す。下/横を向いてどの軸が動くか目視できる
+    const el = document.getElementById('meowdbg');
+    if (el) el.textContent =
+      `FaceFound=${d.FaceFound}  (falseだと追跡切れ=固まる)\n` +
+      `raw   x=${R.x.toFixed(1)}  y=${R.y.toFixed(1)}  z=${R.z.toFixed(1)}\n` +
+      `Δ中立 x=${r.x.toFixed(1)}  y=${r.y.toFixed(1)}  z=${r.z.toFixed(1)}`;
+  }
+  const p = d.Position || { x: 0, y: 0, z: 0 };
+  const el = d.EyeLeft || { x: 0, y: 0 }, er = d.EyeRight || { x: 0, y: 0 };
+  return [
+    'mouthSmile_L-' + g('mouthSmileLeft'), 'mouthSmile_R-' + g('mouthSmileRight'),
+    'browDown_L-' + g('browDownLeft'), 'browDown_R-' + g('browDownRight'),
+    'browOuterUp_L-' + g('browOuterUpLeft'), 'browOuterUp_R-' + g('browOuterUpRight'),
+    'browInnerUp-' + (g('browInnerUpLeft') + g('browInnerUpRight')) / 2,
+    'eyeBlink_L-' + g('eyeBlinkLeft'), 'eyeBlink_R-' + g('eyeBlinkRight'),
+    'jawOpen-' + g('jawOpen'),
+    '=head#' + (() => { const rv = [r.x, r.y, r.z], P = MEOW_PERMS[window._meowAxisI]; return [rv[P[0]], rv[P[1]], rv[P[2]], p.x, p.y, p.z].join(','); })(),
+    'leftEye#' + [el.x, el.y].join(','), 'rightEye#' + [er.x, er.y].join(','),
+  ].join('|');
+}
 function processRawIFM(text) {
+  if (text.charCodeAt(0) === 123) {   // '{' で始まる=MeowFace系JSON。パイプ形式へ変換(iPhone iFMのパイプはそのまま通る)
+    try { text = meowJsonToIFM(text); } catch (e) { return; }
+  }
   // 表情(旧ブリッジ calc_* 移植)
   const fun = clamp01(((ifmVal(text, 'mouthSmile_L') + ifmVal(text, 'mouthSmile_R')) / 2) / 100 * CFG.smileGain);
   let angry = clamp01((ifmVal(text, 'browDown_L') + ifmVal(text, 'browDown_R')) / 300);
@@ -623,7 +681,11 @@ function processRawIFM(text) {
   // 頭(rot deg + pos)
   const h = ifmVec(text, '=head#');
   if (h && h.length >= 6) {
-    const q = eulerDegToQuat(h[0], h[1], h[2]);
+    // 自作ブラウザ版トラッカー(tracker/)は四元数 =headq# も送る。あればそれを使う＝
+    //   オイラー順序/軸の取り違え(MeowFaceで総当たりする羽目になった所)が原理的に起きない。
+    //   無ければ従来通り =head# のオイラー(iFM/MeowFace)から作る。
+    const hq = ifmVec(text, '=headq#');
+    const q = (hq && hq.length >= 4) ? { x: hq[0], y: hq[1], z: hq[2], w: hq[3] } : eulerDegToQuat(h[0], h[1], h[2]);
     setBone('head', [q.x, q.y, q.z, q.w], false);
     rootPos = [CFG.mirror ? -h[3] : h[3], h[4], h[5]];   // 頭position X も鏡映(首信号/体駆動/ドットが一貫して鏡になる)
   }

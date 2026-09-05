@@ -15,6 +15,10 @@ VRoid 等の VRM は舌ジオメトリを持たないため、iFacialMocap の t
 使い方:
   python tools/vrm_add_tongue.py renderer/assets/model.vrm renderer/assets/model_tongue.vrm
   # 形/位置の微調整は下の TUNE 定数、または実行時の renderer 側 "舌 強さ" スライダーで。
+  # ※ numpy が要る。renderer/.venv には入っていないので、numpy のある python で実行すること。
+
+前提(満たさないと SystemExit で止まる): Fcl_* モーフを持つ顔メッシュ(=VRoid系VRM)、
+口の位置を測る FaceMouth 系マテリアル、humanoid の head 骨が顔スキンの joints に居ること。
 """
 import json
 import struct

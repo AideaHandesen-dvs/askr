@@ -1,0 +1,1113 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Face Tracker (送信側)</title>
+<style>
+  :root {
+    --bg: #111;
+    --fg: #eee;
+    --accent: #4caf50;
+    --warn: #ffc107;
+    --danger: #f44336;
+    --panel: #222;
+    --border: #333;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 8px;
+    overflow-y: auto;
+  }
+  #errorBanner {
+    width: 100%;
+    background: var(--danger);
+    color: #fff;
+    padding: 10px 12px;
+    border-radius: 6px;
+    margin-bottom: 8px;
+    display: none;
+    font-size: 14px;
+    line-height: 1.6;
+    text-align: left;
+    word-break: break-all;
+  }
+  #videoWrap {
+    width: 100%;
+    max-width: 480px;
+    border-radius: 12px;
+    overflow: hidden;
+    background: #000;
+    position: relative;
+    aspect-ratio: 4/3;
+  }
+  video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transform: scaleX(-1); /* 自撮りは鏡像が自然 */
+  }
+  #statusLine {
+    width: 100%;
+    max-width: 480px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 8px 0;
+    font-size: 14px;
+    font-weight: bold;
+  }
+  .statusItem {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+    flex: 1 1 auto;
+    text-align: center;
+  }
+  .statusItem .label { font-size: 11px; opacity: 0.7; }
+  .statusItem .value { font-size: 14px; }
+  .ok { color: var(--accent); }
+  .warn { color: var(--warn); }
+  .bad { color: var(--danger); }
+  #buttons {
+    width: 100%;
+    max-width: 480px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  button {
+    background: var(--panel);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 16px;
+    cursor: pointer;
+    min-height: 44px;
+    transition: background 0.2s;
+  }
+  button:active { background: #333; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #hud {
+    width: 100%;
+    max-width: 480px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px;
+    font-family: "Courier New", monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  #hudTitle {
+    font-weight: bold;
+    margin-bottom: 4px;
+    color: var(--accent);
+  }
+</style>
+</head>
+<body>
+  <div id="errorBanner"></div>
+  <div id="videoWrap">
+    <video id="video" autoplay muted playsinline></video>
+  </div>
+  <div id="statusLine">
+    <div class="statusItem"><div class="label">WebSocket</div><div id="wsStatus" class="value bad">切断</div></div>
+    <div class="statusItem"><div class="label">顔</div><div id="faceStatus" class="value warn">検出待ち</div></div>
+    <div class="statusItem"><div class="label">推論</div><div id="inferFps" class="value">0 fps</div></div>
+    <div class="statusItem"><div class="label">送信</div><div id="sendFps" class="value">0 fps</div></div>
+  </div>
+  <div id="buttons">
+    <button id="btnNeutral">中立に取り直す</button>
+    <button id="btnCamera">カメラ切替</button>
+    <button id="btnSend">送信 ON/OFF</button>
+    <button id="btnWakeLock">スリープ防止</button>
+    <button id="btnPitch">カメラ正対補正</button>
+    <button id="btnTongue">舌 校正</button>
+  </div>
+  <div id="hud">
+    <div id="hudTitle">数値 HUD</div>
+    <div id="hudContent">--</div>
+  </div>
+
+  <script type="module">
+    // 同梱の MediaPipe(tasks-vision 1.0.1)。CDNは使わない＝LAN内・オフラインで動く
+    import { FilesetResolver, FaceLandmarker } from './vendor/vision_bundle.mjs';
+
+    // ===== 定数 =====
+    const CFG = {
+      SEND_HZ: 30,          // 送信間引き (0 なら毎フレーム)
+      GAZE_DEG: 25,         // 目線の度変換係数
+      POS_SCALE: 0.01,      // cm → m
+      MAX_BUFFERED: 64 * 1024, // WebSocket バッファ上限 (bytes)
+      SMOOTH: 0.3,          // 頭四元数の EMA 係数 (0 で無効)
+      // カメラ正対補正。実機で **仰角(pitch)と傾げ(roll)だけが逆、左右(yaw)は正しい** と判明した。
+      //   この「x,z だけ反転・y は不変」は数学的には **Y軸まわり180°回転による共役** と同じ:
+      //     q' = Ry(180°)·q·Ry(180°)⁻¹  ⇔  (x,y,z,w) → (-x, y, -z, w)
+      //   意味も素直で、**自撮りカメラは被写体と向き合っている**＝カメラ基準の座標系は
+      //   アバター基準の座標系に対してY軸まわりに180°回っている。その1つの事実の帰結。
+      //   (ヨーが不変なのは回転軸そのものがYだから。観測と完全に一致する)
+      //   背面カメラや特殊な設置で違ったら画面の「カメラ正対補正」ボタンで切替(localStorageに残る)。
+      CAM_FACING_180: true,
+      // ==== 舌出し(レロレロ) ====
+      // MediaPipe の tongueOut は**カテゴリはあるが値が出ない**(舌を明確に出した写真41フレームで最大0.0を実測)。
+      // なので自前で推定する: 内唇ポリゴンの内側だけのピクセルを見て「暗い口腔」か「明るい赤=舌」かを数える。
+      //   ・内側だけを見るのが肝。唇そのものが赤いので、bboxで切ると唇を舌と誤検出する。
+      //   ・歯は明るいが赤くない(r≈0.33)ので TONGUE_R で落ちる。口腔は暗いので TONGUE_L で落ちる。
+      TONGUE_R: 0.40,        // 赤み R/(R+G+B)。これ超で「赤い側」
+      TONGUE_L: 0.20,        // 明度(0..1)。これ超で「明るい側」＝奥の暗い口腔を落とす
+      TONGUE_S: 0.25,        // 彩度(max-min)/max。**歯は白=低彩度**なのでこれで落とす(舌は赤=高彩度)
+      // 生比率(開口部のうち舌と判定された割合)を 0..1 へ写す区間。実測で決めた:
+      //   歯を見せた笑顔=0.33 / 正面の舌出し=0.57 → 間を取って LO=0.42, HI=0.62
+      TONGUE_SHRINK: 0.72,   // 内側ポリゴンをこの比率まで重心へ縮めてから測る(唇の縁を巻き込まない)
+      TONGUE_LO: 0.42,
+      TONGUE_HI: 0.62,
+      // ★舌の判定は**どの特徴量をどちら向きに使うかが照明と端末の位置で変わる**(2026-09-04 実測)。
+      //   同じ人・同じ日に採った2組の3相校正で、符号がそのまま反転した:
+      //     A) 口の中の歯がよく写る条件 → 舌を出すと歯が隠れて「歯」が下がる(0.383→0.042)
+      //     B) 口の中が影になる条件     → 出した舌が外光を受けて明るく写り「歯」が上がる(0.076→0.561)
+      //   どちらも物理的に正しい。だから**向きを決め打ちしてはいけない**。
+      //   校正(3相)が候補の中から「③舌が①②の両方から最も離れる軸」を選び、下の規則を書き換える。
+      //   lo=舌らしさ0の点 / hi=舌らしさ1の点。hi<lo でも良い(降順の軸はそれで表す)。
+      //   既定値は 2026-09-04 の実測(B条件)の暫定値。**本人の照明で3回押せば置き換わる**。
+      TONGUE_RULE: { key: 'b', lo: 0.30, hi: 0.36 },
+      // 相対特徴の作り方。口の中自身の平均に対する倍率で「暗い/明るい」を決める。
+      TONGUE_DARK_REL: 0.75,   // 平均明度のこの倍より暗い画素 = 奥
+      TONGUE_TEETH_REL: 1.25,  // 平均明度のこの倍より明るく、かつ
+      TONGUE_TEETH_SAT: 0.80,  //   平均彩度のこの倍より白い画素 = 歯
+      // 左右を入れ替えるか。既定 true(実機でウィンク・目線が両方とも逆だったため)。
+      // `?lr=0` で無効にできる ＝ リロード1回で A/B できる。
+      SWAP_LR: !new URLSearchParams(location.search).has('lr') ||
+               new URLSearchParams(location.search).get('lr') !== '0',
+      TONGUE_MIN_OPEN: 0.60, // 唇の隙間の高さ÷口の幅。これ未満なら 0。**実機実測(2026-09-02)で決めた**:
+                             //   閉口 0.07〜0.17 / 「う」 0.53〜0.73 / 笑い 0.30〜0.43 に対し
+                             //   口を開けた状態(舌の有無に関わらず)は 0.88〜1.03。0.6 で綺麗に割れる。
+                             //   ※旧値 0.04 は緩すぎて、閉口(生比率0.98)をそのまま通していた。
+      TONGUE_MIN_AREA: 1200, // 収縮後ポリゴンの画素数。閉口時は輪郭が潰れて 99〜407 まで落ちるので、
+                             //   これで二重に殺す(開口時は 1400〜1670)。
+                             //   ※jawOpen(顎)では門番にならない: 顎を開けずに舌だけ出す「べー」が
+                             //     jawOpen≈0 になるのを実写で確認したため、唇の隙間を幾何で測る。
+    };
+    // 前回の選択を復元(スマホではコンソールが使えないので、画面のボタン＋保存で完結させる)
+    try {
+      const saved = localStorage.getItem('askr_cam180');
+      if (saved !== null) CFG.CAM_FACING_180 = saved === '1';
+    } catch (e) { /* プライベートモード等でlocalStorageが無くても動く */ }
+
+    const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+    // 左右の入れ替え。`…Left`/`…Right` で終わる名前だけを対象にする。
+    // `jawLeft`/`mouthLeft` 等の「左右に寄せる方向」を表すシェイプは対にならないので触らない
+    // (これらは iFM でも _L/_R を持たない。IFM_NAME_VERBATIM と同じ理由)。
+    const LR_VERBATIM = new Set(['jawLeft', 'jawRight', 'mouthLeft', 'mouthRight']);
+    function swapLR(n) {
+      if (LR_VERBATIM.has(n)) return n;
+      if (n.endsWith('Left')) return n.slice(0, -4) + 'Right';
+      if (n.endsWith('Right')) return n.slice(0, -5) + 'Left';
+      return n;
+    }
+
+    // ===== 状態 =====
+    const state = {
+      landmarker: null,
+      video: null,
+      stream: null,
+      facingMode: 'user',
+      ws: null,
+      wsConnected: false,
+      sendEnabled: true,
+      sendTimer: null,
+      lastSendTime: 0,
+      inferFrames: 0,
+      inferLastTime: 0,
+      sendFrames: 0,
+      sendLastTime: 0,
+      lastTimestamp: -1,
+      neutralQuat: null,   // 中立四元数 (Unity 規約に変換する前の生の q)
+      lastQrel: null,      // 前フレームの qrel (SMOOTH 用)
+      wakeLock: null,
+      wakeLockSupported: 'wakeLock' in navigator,
+      tongue: 0,           // 自前推定の舌出し(平滑後 0..1)
+      tongueRaw: 0,        // 平滑前の生比率(しきい値を詰める時に見る)
+      mouthOpen: 0,        // 唇の隙間の縦横比(舌の門番。顎の開きとは別物)
+      calPhase: 0,         // 舌の校正: 0=未実施/完了, 1=「舌なし」収集中, 2=「舌あり」収集中
+      calBuf: [],          // 収集中の観測(特徴量ひと揃い)。生比率だけでなく候補を全部ためる
+      calResult: null,     // 校正の結果(①②の中央値)。押した後なら後から誰でも読めるように残す
+      calResultUntil: 0,   // その結果を送信に載せる期限(performance.now)
+      // ブレンドシェイプ用の一時マップ
+      blendshapeMap: new Map(),
+    };
+
+    // ===== DOM 参照 =====
+    const videoEl = document.getElementById('video');
+    const errorBanner = document.getElementById('errorBanner');
+    const wsStatusEl = document.getElementById('wsStatus');
+    const faceStatusEl = document.getElementById('faceStatus');
+    const inferFpsEl = document.getElementById('inferFps');
+    const sendFpsEl = document.getElementById('sendFps');
+    const btnNeutral = document.getElementById('btnNeutral');
+    const btnCamera = document.getElementById('btnCamera');
+    const btnSend = document.getElementById('btnSend');
+    const btnWakeLock = document.getElementById('btnWakeLock');
+    const btnPitch = document.getElementById('btnPitch');
+    const btnTongue = document.getElementById('btnTongue');
+    const hudContent = document.getElementById('hudContent');
+
+    // ===== エラー表示 =====
+    function showError(msg) {
+      console.error(msg);
+      errorBanner.textContent = msg;
+      errorBanner.style.display = 'block';
+    }
+    function clearError() {
+      errorBanner.style.display = 'none';
+    }
+
+    // ===== 初期化 =====
+    async function init() {
+      // カメラは「セキュアコンテキスト」でしか使えない。**protocol ではなく isSecureContext を見る**のは、
+      //   chrome://flags でこのオリジンを安全扱いにすると http のままでも通るため(その逃げ道を潰さない)。
+      //   ここまで表示できている＝ネットワークは生きている。ので、残りの手をその場に出して止める。
+      if (!window.isSecureContext) {
+        const origin = location.origin;
+        errorBanner.innerHTML =
+          '<b>カメラだけ使えません</b>（ページは開けている＝ネットワークは生きています）<br>' +
+          'ブラウザは https か localhost でないとカメラを渡さない仕様です。どちらかで解決します:<br><br>' +
+          '<b>方法A（証明書の警告を1回通す）</b><br>' +
+          '<a style="color:#fff" href="https://' + location.hostname + ':8443/">https://' + location.hostname + ':8443/</a>' +
+          ' を開く → 「詳細設定」→「' + location.hostname + ' にアクセスする」<br><br>' +
+          '<b>方法B（証明書を一切使わない）</b><br>' +
+          'アドレス欄に <code>chrome://flags/#unsafely-treat-insecure-origin-as-secure</code> を入れ、' +
+          '枠に <code>' + origin + '</code> を貼って Enabled → 再起動。' +
+          'この口(' + origin + ')のままカメラが使えるようになります。';
+        errorBanner.style.display = 'block';
+        console.error('not a secure context:', origin);
+        return;
+      }
+      clearError();
+
+      // モデル読み込み
+      try {
+        const fileset = await FilesetResolver.forVisionTasks('./vendor/wasm');
+        try {
+          state.landmarker = await FaceLandmarker.createFromOptions(fileset, {
+            baseOptions: { modelAssetPath: './vendor/face_landmarker.task', delegate: 'GPU' },
+            runningMode: 'VIDEO',
+            numFaces: 1,
+            outputFaceBlendshapes: true,
+            outputFacialTransformationMatrixes: true,
+          });
+        } catch (e) {
+          console.warn('GPU デリゲート失敗、CPU で再試行', e);
+          state.landmarker = await FaceLandmarker.createFromOptions(fileset, {
+            baseOptions: { modelAssetPath: './vendor/face_landmarker.task', delegate: 'CPU' },
+            runningMode: 'VIDEO',
+            numFaces: 1,
+            outputFaceBlendshapes: true,
+            outputFacialTransformationMatrixes: true,
+          });
+        }
+      } catch (e) {
+        showError('モデル読み込み失敗: ' + e.message);
+        return;
+      }
+
+      // カメラ開始
+      await startCamera();
+
+      // WebSocket 接続
+      connectWS();
+
+      // ボタン設定
+      btnNeutral.addEventListener('click', resetNeutral);
+      btnCamera.addEventListener('click', switchCamera);
+      btnSend.addEventListener('click', toggleSend);
+      btnWakeLock.addEventListener('click', toggleWakeLock);
+      btnSend.textContent = state.sendEnabled ? '送信 ON' : '送信 OFF';
+      // 舌の校正。**ストック写真で閾値を決めても意味がない**(肌・照明・カメラが本番と違う)ので、
+      //   本人の顔・本人の照明・本人の置き方で決める。
+      // ★3相なのは 2026-09-04 の実測で「2相では原理的に足りない」と分かったため。
+      //   舌は「歯が見える口」と「あーん(暗い口)」の**中間**に居るので、片方としか比べないと
+      //   閾値の向きすら定まらない(実際、比べる相手を変えたら明度の大小関係が反転した)。
+      //   ①歯を見せて開ける ②あーん(舌を伏せて大きく開ける) ③舌を出す、の3点で挟む。
+      try {
+        const c = JSON.parse(localStorage.getItem('askr_tongue_rule') || 'null');
+        if (c && c.key && isFinite(c.lo) && isFinite(c.hi) && c.lo !== c.hi) CFG.TONGUE_RULE = c;
+      } catch (e) {}
+      const CAL_STEPS = [
+        { n: 1, ask: '① 口を開けて歯を見せ、押す', busy: '① 歯を見せたまま… 収集中' },
+        { n: 2, ask: '②「あーん」(舌を下に伏せる)で押す', busy: '② あーんのまま… 収集中' },
+        { n: 3, ask: '③ 舌を出して押す', busy: '③ 舌を出したまま… 収集中' },
+      ];
+      const drawTongueBtn = () => {
+        const st = CAL_STEPS[calStep];
+        btnTongue.textContent = state.calPhase === 0
+          ? `舌 校正: ${st.ask}`
+          : st.busy;
+      };
+      const collect = (ms) => new Promise((res) => {          // ms 間ためて観測の配列を返す
+        state.calBuf = [];
+        setTimeout(() => res(state.calBuf.slice()), ms);
+      });
+      const CAL_KEYS = ['raw', 'open', 'inside', 'darkR', 'teethR', 'cv', 'dark', 'teeth', 'redLo', 'redLoBot', 'b', 's', 'r'];
+      const quant = (rows, k, q) => {
+        const a = rows.map((r) => r[k] ?? 0).sort((x, y) => x - y);
+        return a.length ? a[Math.min(a.length - 1, Math.round(q * (a.length - 1)))] : 0;
+      };
+      const median = (rows, k) => quant(rows, k, 0.5);
+      let calStep = 0;                                        // 0..2 = 次に採る相
+      const calRows = [null, null, null];
+      drawTongueBtn();
+      btnTongue.addEventListener('click', async () => {
+        if (state.calPhase !== 0) return;                      // 収集中は無視
+        const st = CAL_STEPS[calStep];
+        state.calPhase = st.n; drawTongueBtn();
+        const rows = await collect(1500);
+        state.calPhase = 0;
+        // どの相でも口が開いていないと対比にならない。閉口を混ぜると測れるのは「口の開閉」であって
+        // 舌ではなく、黙って通すと**間違った閾値を本人の顔で確定してしまう**。
+        const op = median(rows, 'open');
+        if (op < CFG.TONGUE_MIN_OPEN || rows.length < 5) {
+          btnTongue.textContent = `${st.n}: 口を開けたまま押す (今 ${op.toFixed(2)} / ${CFG.TONGUE_MIN_OPEN} 以上)`;
+          return;
+        }
+        calRows[calStep] = rows;
+        calStep++;
+        if (calStep < CAL_STEPS.length) { drawTongueBtn(); return; }
+        calStep = 0;
+
+        // --- 3相そろった。**どの軸をどちら向きに使うかをここで選ぶ** ---
+        // 候補それぞれについて、③舌の帯が ①②**両方**の帯から離れているかを見る。
+        // 上に離れていても下に離れていても良い(向きは照明と端末の位置で反転するため決め打ちしない)。
+        // 選ぶ基準は「余裕÷散らばり」= 帯の幅に対してどれだけ離れているか。
+        const CANDIDATES = ['darkR', 'teethR', 'cv', 'b', 'teeth', 'dark', 's', 'r', 'redLo', 'redLoBot', 'raw'];
+        let pick = null;
+        for (const k of CANDIDATES) {
+          const t10 = quant(calRows[2], k, 0.1), t90 = quant(calRows[2], k, 0.9);
+          const o90 = Math.max(quant(calRows[0], k, 0.9), quant(calRows[1], k, 0.9));   // 非舌の上端
+          const o10 = Math.min(quant(calRows[0], k, 0.1), quant(calRows[1], k, 0.1));   // 非舌の下端
+          const spread = ((t90 - t10) +
+            (quant(calRows[0], k, 0.9) - quant(calRows[0], k, 0.1)) +
+            (quant(calRows[1], k, 0.9) - quant(calRows[1], k, 0.1))) / 3 + 1e-6;
+          // 上に離れている場合と下に離れている場合を両方見る
+          const up = t10 - o90, down = o10 - t90;
+          const [gap, lo, hi] = up > down ? [up, o90, t10] : [down, o10, t90];
+          const score = gap / spread;
+          if (gap > 0 && (pick === null || score > pick.score)) pick = { key: k, lo, hi, gap, score };
+        }
+        // **結果を端末側に残す**。流れていく瞬間にしか無いと、押す時にPC側が聞いていないと消え、
+        // 毎回タイミングを合わせる羽目になる。押した後10分間だけ送信に載せる。
+        state.calResult = calRows.map((r) => r.length).join('/') + ';' + CAL_KEYS.map((k) =>
+          calRows.map((r) => [0.1, 0.5, 0.9].map((q) => quant(r, k, q).toFixed(4)).join('/')).join('/')
+        ).join(',');
+        state.calResultUntil = performance.now() + 600000;
+        // どの軸でも③が①②から離れなかったら**設定を壊さず据え置く**。
+        // 差が出ない事自体が正しい観測なので、上の calResult は残す(後から数字で原因を追える)。
+        if (!pick) {
+          btnTongue.textContent = '舌 校正: どの軸でも分離せず(照明/角度を変えて再試行)';
+          return;
+        }
+        const rule = { key: pick.key, lo: +pick.lo.toFixed(4), hi: +pick.hi.toFixed(4) };
+        CFG.TONGUE_RULE = rule;
+        // 選ばれた軸も一緒に残す。PC側から読んだ時に「何が選ばれたか」が見えないと、
+        // 数字の表だけ見て人間が別の軸を推すことになる(=自動選定の意味が無くなる)。
+        state.calResult += `;${rule.key}/${rule.lo}/${rule.hi}/${pick.gap.toFixed(4)}`;
+        try { localStorage.setItem('askr_tongue_rule', JSON.stringify(rule)); } catch (e) {}
+        drawTongueBtn();
+        // 何が選ばれたかを画面に出す。**選定は自動なので、結果が見えないと信用できない**。
+        btnTongue.textContent = `✓記録 ${rule.key}: ${rule.lo.toFixed(3)}→${rule.hi.toFixed(3)} (余裕 ${pick.gap.toFixed(3)})`;
+      });
+      const drawPitchBtn = () => { btnPitch.textContent = 'カメラ正対補正 (今: ' + (CFG.CAM_FACING_180 ? 'ON' : 'OFF') + ')'; };
+      drawPitchBtn();
+      btnPitch.addEventListener('click', () => {     // 上を向いた時にアバターも上を向く方を選ぶ
+        CFG.CAM_FACING_180 = !CFG.CAM_FACING_180;
+        try { localStorage.setItem('askr_cam180', CFG.CAM_FACING_180 ? '1' : '0'); } catch (e) {}
+        drawPitchBtn();
+      });
+      if (!state.wakeLockSupported) {
+        btnWakeLock.disabled = true;
+        btnWakeLock.textContent = 'スリープ防止 (非対応)';
+      }
+
+      // 推論ループ開始
+      loop();
+    }
+
+    // ===== カメラ =====
+    async function startCamera() {
+      if (state.stream) {
+        state.stream.getTracks().forEach(t => t.stop());
+      }
+      try {
+        state.stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            facingMode: state.facingMode,
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            frameRate: { ideal: 30 },
+          },
+        });
+        videoEl.srcObject = state.stream;
+        await videoEl.play();
+      } catch (e) {
+        showError('カメラ取得失敗: ' + e.message);
+      }
+    }
+
+    async function switchCamera() {
+      state.facingMode = state.facingMode === 'user' ? 'environment' : 'user';
+      await startCamera();
+    }
+
+    // ===== WebSocket =====
+    function connectWS() {
+      const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+      const url = proto + location.host + '/ws';
+      try {
+        state.ws = new WebSocket(url);
+      } catch (e) {
+        showError('WebSocket 接続失敗: ' + e.message);
+        return;
+      }
+      state.ws.onopen = () => {
+        state.wsConnected = true;
+        wsStatusEl.textContent = '接続';
+        wsStatusEl.className = 'value ok';
+      };
+      state.ws.onclose = () => {
+        state.wsConnected = false;
+        wsStatusEl.textContent = '切断・再試行中';
+        wsStatusEl.className = 'value bad';
+        setTimeout(connectWS, 1000);
+      };
+      state.ws.onerror = (e) => {
+        console.error('WS error', e);
+      };
+    }
+
+    // ===== 中立リセット =====
+    function resetNeutral() {
+      state.neutralQuat = null;
+      state.lastQrel = null;
+      btnNeutral.textContent = '取得中…';
+      setTimeout(() => {
+        btnNeutral.textContent = '中立に取り直す';
+      }, 1000);
+    }
+
+    // ===== 送信トグル =====
+    function toggleSend() {
+      state.sendEnabled = !state.sendEnabled;
+      btnSend.textContent = state.sendEnabled ? '送信 ON' : '送信 OFF';
+    }
+
+    // ===== スリープ防止 =====
+    async function toggleWakeLock() {
+      if (!state.wakeLockSupported) return;
+      if (state.wakeLock) {
+        await state.wakeLock.release();
+        state.wakeLock = null;
+        btnWakeLock.textContent = 'スリープ防止';
+      } else {
+        try {
+          state.wakeLock = await navigator.wakeLock.request('screen');
+          btnWakeLock.textContent = 'スリープ防止 (ON)';
+        } catch (e) {
+          showError('WakeLock 取得失敗: ' + e.message);
+        }
+      }
+    }
+
+    // 可視性変化で WakeLock 再取得
+    document.addEventListener('visibilitychange', async () => {
+      if (document.visibilityState === 'visible' && state.wakeLock) {
+        try {
+          state.wakeLock = await navigator.wakeLock.request('screen');
+        } catch (e) {
+          console.warn('WakeLock 再取得失敗', e);
+        }
+      }
+    });
+
+    // ===== 推論ループ =====
+    //   requestVideoFrameCallback があれば「新しいカメラフレームが来た時だけ」推論する。
+    //   rAF は画面の60Hzで回る＝30fpsのカメラでは同じ絵を2回推論して、発熱と電池を無駄に食う。
+    const useRVFC = typeof videoEl.requestVideoFrameCallback === 'function';
+    function scheduleNext() {
+      if (useRVFC) videoEl.requestVideoFrameCallback(() => loop());
+      else requestAnimationFrame(() => loop());
+    }
+    function loop() {
+      if (state.landmarker && videoEl.readyState >= 2) {
+        // detectForVideo は同じ timestamp を二度渡すと例外を投げる＝必ず単調増加させる
+        let ts = performance.now();
+        if (ts <= state.lastTimestamp) ts = state.lastTimestamp + 1;
+        state.lastTimestamp = ts;
+
+        try {
+          const result = state.landmarker.detectForVideo(videoEl, ts);
+          processResult(result);
+        } catch (e) {
+          console.error('detectForVideo error', e);
+        }
+      }
+
+      // FPS 計算
+      const nowMs = performance.now();
+      state.inferFrames++;
+      if (nowMs - state.inferLastTime >= 1000) {
+        inferFpsEl.textContent = state.inferFrames + ' fps';
+        state.inferFrames = 0;
+        state.inferLastTime = nowMs;
+      }
+      scheduleNext();
+    }
+
+    // ===== 結果処理 =====
+    function processResult(result) {
+      // 顔検出状態
+      if (result.faceBlendshapes && result.faceBlendshapes.length > 0) {
+        faceStatusEl.textContent = '検出';
+        faceStatusEl.className = 'value ok';
+      } else {
+        faceStatusEl.textContent = 'ロスト';
+        faceStatusEl.className = 'value warn';
+        return;
+      }
+
+      // ブレンドシェイプを Map に詰める。
+      // ★ここで左右を入れ替えられるようにしてある(CFG.SWAP_LR)。理由:
+      //   実機で**ウィンクと目線が両方とも左右逆**に出た。頭は正しいまま目だけ2つとも逆、
+      //   という組み合わせは「MediaPipe の Left/Right が本人基準ではなく画像基準(鏡像)」で
+      //   きれいに説明がつく。目線は左右の目の平均を取るが、式が左右で符号違い
+      //   (左目 Out-In / 右目 In-Out)なので、ラベルが入れ替わると**平均の符号ごと反転する**。
+      //   頭は変換行列から作るので無傷。症状と一致する。
+      //   確定はさせていない(向きを画で確かめるのが一番速い)ので URL で戻せる: `?lr=0`
+      state.blendshapeMap.clear();
+      const categories = result.faceBlendshapes[0].categories;
+      for (const cat of categories) {
+        state.blendshapeMap.set(CFG.SWAP_LR ? swapLR(cat.categoryName) : cat.categoryName, cat.score);
+      }
+
+      // 頭ポーズ計算(変換行列が無いフレームは頭だけ諦める＝例外で止めない)
+      if (!result.facialTransformationMatrixes || !result.facialTransformationMatrixes.length) return;
+      const head = computeHead(result);
+      // 目線計算
+      const gaze = computeGaze();
+      // 舌(自前推定)。EMAで少しだけ均す＝1フレームのノイズでベロが跳ねない
+      const tRaw = computeTongue(result);
+      state.tongue = state.tongue * 0.6 + tRaw * 0.4;
+      // 校正中は候補の特徴量をひと揃いためる。**生比率1個だけためると、後から
+      // 「別の特徴量の方が良かった」と分かった時に測り直しになる**ので全部残す。
+      if (state.calPhase && state.tFeatOk) {
+        state.calBuf.push(Object.assign(
+          { raw: state.tongueRaw, open: state.mouthOpen, inside: state.tongueInside || 0 },
+          state.tFeat || {}));
+      }
+
+      checkShapeCoverage();   // 初回だけ、送信カテゴリの取りこぼしを照合
+
+      // HUD 更新
+      updateHUD(head, gaze);
+
+      // 送信
+      if (state.sendEnabled && state.wsConnected && state.ws.readyState === WebSocket.OPEN) {
+        // 送信間引き
+        const now = performance.now();
+        if (CFG.SEND_HZ > 0) {
+          const interval = 1000 / CFG.SEND_HZ;
+          if (now - state.lastSendTime < interval) return;
+        }
+        // バッファ確認
+        if (state.ws.bufferedAmount > CFG.MAX_BUFFERED) {
+          // 詰まり防止: このフレームは捨てる
+          return;
+        }
+        const msg = buildMessage(head, gaze);
+        state.ws.send(msg);
+        state.lastSendTime = now;
+        state.sendFrames++;
+        // 送信 FPS 更新
+        if (now - state.sendLastTime >= 1000) {
+          sendFpsEl.textContent = state.sendFrames + ' fps';
+          state.sendFrames = 0;
+          state.sendLastTime = now;
+        }
+      }
+    }
+
+    // ===== 頭ポーズ計算 =====
+    function computeHead(result) {
+      const matrix = result.facialTransformationMatrixes[0].data; // column-major 4x4
+      // 回転行列 R[row][col] = m[col*4 + row]
+      const R = [
+        [matrix[0], matrix[4], matrix[8]],
+        [matrix[1], matrix[5], matrix[9]],
+        [matrix[2], matrix[6], matrix[10]],
+      ];
+      // 平行移動 t = (m[12], m[13], m[14])
+      const t = [matrix[12], matrix[13], matrix[14]];
+
+      // 四元数 q (Shepperd 法)
+      const q = matrixToQuat(R);
+
+      // 中立差分
+      if (!state.neutralQuat) {
+        state.neutralQuat = q;
+      }
+      const qn = state.neutralQuat;
+      // qrel = q * conj(qn)   (R = ΔR·Rn ⇒ ΔR = R·Rnᵀ)
+      const qrel = quatMultiply(q, quatConjugate(qn));
+
+      // SMOOTH 適用 (線形補間＋正規化)
+      let qrelFinal = qrel;
+      if (CFG.SMOOTH > 0 && state.lastQrel) {
+        const prev = state.lastQrel;
+        // 符号反転チェック
+        let dot = prev.x * qrel.x + prev.y * qrel.y + prev.z * qrel.z + prev.w * qrel.w;
+        let q2 = qrel;
+        if (dot < 0) {
+          q2 = { x: -qrel.x, y: -qrel.y, z: -qrel.z, w: -qrel.w };
+          dot = -dot;
+        }
+        const alpha = CFG.SMOOTH;
+        const interp = {
+          x: prev.x * (1 - alpha) + q2.x * alpha,
+          y: prev.y * (1 - alpha) + q2.y * alpha,
+          z: prev.z * (1 - alpha) + q2.z * alpha,
+          w: prev.w * (1 - alpha) + q2.w * alpha,
+        };
+        // 正規化
+        const len = Math.hypot(interp.x, interp.y, interp.z, interp.w);
+        if (len > 1e-8) {
+          qrelFinal = {
+            x: interp.x / len,
+            y: interp.y / len,
+            z: interp.z / len,
+            w: interp.w / len,
+          };
+        }
+      }
+      state.lastQrel = qrelFinal;
+
+      // Unity 規約へ変換: (-x, -y, z, w)
+      const unityQ = {
+        x: -qrelFinal.x,
+        y: -qrelFinal.y,
+        z: qrelFinal.z,
+        w: qrelFinal.w,
+      };
+
+      // カメラ正対補正(Y軸まわり180°の共役)はここで掛ける。**Unity規約へ直した後**に掛けるので、
+      //   =headq# と 互換用の =head#(オイラー) が必ず同じ姿勢を指す(片方だけ直る事故を防ぐ)。
+      //   共役なのでノルムは変わらない＝単位四元数のまま。
+      if (CFG.CAM_FACING_180) { unityQ.x = -unityQ.x; unityQ.z = -unityQ.z; }
+
+      // オイラー角 (XYZ 順序, 度)
+      const euler = quatToEulerXYZ(unityQ);
+
+      // 位置 (cm→m, 符号反転)
+      const pos = {
+        x: -t[0] * CFG.POS_SCALE,
+        y: -t[1] * CFG.POS_SCALE,
+        z: t[2] * CFG.POS_SCALE,
+      };
+
+      return {
+        quat: unityQ,
+        euler: euler, // {x,y,z} 度
+        pos: pos,
+      };
+    }
+
+    // 行列→四元数 (Shepperd 法)
+    function matrixToQuat(R) {
+      const m00 = R[0][0], m01 = R[0][1], m02 = R[0][2];
+      const m10 = R[1][0], m11 = R[1][1], m12 = R[1][2];
+      const m20 = R[2][0], m21 = R[2][1], m22 = R[2][2];
+      const trace = m00 + m11 + m22;
+      let q;
+      if (trace > 0) {
+        const s = Math.sqrt(trace + 1.0) * 2;
+        q = {
+          w: 0.25 * s,
+          x: (m21 - m12) / s,
+          y: (m02 - m20) / s,
+          z: (m10 - m01) / s,
+        };
+      } else if (m00 > m11 && m00 > m22) {
+        const s = Math.sqrt(1.0 + m00 - m11 - m22) * 2;
+        q = {
+          w: (m21 - m12) / s,
+          x: 0.25 * s,
+          y: (m01 + m10) / s,
+          z: (m02 + m20) / s,
+        };
+      } else if (m11 > m22) {
+        const s = Math.sqrt(1.0 + m11 - m00 - m22) * 2;
+        q = {
+          w: (m02 - m20) / s,
+          x: (m01 + m10) / s,
+          y: 0.25 * s,
+          z: (m12 + m21) / s,
+        };
+      } else {
+        const s = Math.sqrt(1.0 + m22 - m00 - m11) * 2;
+        q = {
+          w: (m10 - m01) / s,
+          x: (m02 + m20) / s,
+          y: (m12 + m21) / s,
+          z: 0.25 * s,
+        };
+      }
+      // 正規化
+      const len = Math.hypot(q.x, q.y, q.z, q.w);
+      if (len > 1e-8) {
+        q.x /= len; q.y /= len; q.z /= len; q.w /= len;
+      }
+      return q;
+    }
+
+    // 四元数共役
+    function quatConjugate(q) {
+      return { x: -q.x, y: -q.y, z: -q.z, w: q.w };
+    }
+
+    // 四元数積 (q1 * q2)
+    function quatMultiply(q1, q2) {
+      return {
+        w: q1.w * q2.w - q1.x * q2.x - q1.y * q2.y - q1.z * q2.z,
+        x: q1.w * q2.x + q1.x * q2.w + q1.y * q2.z - q1.z * q2.y,
+        y: q1.w * q2.y - q1.x * q2.z + q1.y * q2.w + q1.z * q2.x,
+        z: q1.w * q2.z + q1.x * q2.y - q1.y * q2.x + q1.z * q2.w,
+      };
+    }
+
+    // 四元数→オイラー角(度)。**three.js の Euler order 'XYZ' と同じ分解**にすること。
+    //   受信側は eulerDegToQuat = Euler(rx,ry,rz,'XYZ') → setFromEuler で四元数へ戻すので、
+    //   ここが航空機式(ZYX の yaw/pitch/roll)だと同じ数値が別の姿勢に化ける。
+    //   ※ =headq# を読む受信側では使われない。古い受信側向けの互換経路。
+    function quatToEulerXYZ(q) {
+      const x = q.x, y = q.y, z = q.z, w = q.w;
+      // 四元数→回転行列(row-major)。three.js の makeRotationFromQuaternion と同じ並び
+      const m11 = 1 - 2 * (y * y + z * z), m12 = 2 * (x * y - w * z), m13 = 2 * (x * z + w * y);
+      const m22 = 1 - 2 * (x * x + z * z), m23 = 2 * (y * z - w * x);
+      const m32 = 2 * (y * z + w * x), m33 = 1 - 2 * (x * x + y * y);
+      const clamp = (v) => (v < -1 ? -1 : v > 1 ? 1 : v);
+      let ex, ey, ez;
+      ey = Math.asin(clamp(m13));
+      if (Math.abs(m13) < 0.9999999) {
+        ex = Math.atan2(-m23, m33);
+        ez = Math.atan2(-m12, m11);
+      } else {                       // ジンバルロック(真上/真下)。z を捨てて x に寄せる
+        ex = Math.atan2(m32, m22);
+        ez = 0;
+      }
+      const rad2deg = 180 / Math.PI;
+      return { x: ex * rad2deg, y: ey * rad2deg, z: ez * rad2deg };
+    }
+
+    // ===== 舌出し推定(MediaPipeが出さないので自前) =====
+    // MediaPipe FaceMesh の「内唇」ランドマーク。**外唇ではなく内唇**＝口の開口部そのもの。
+    const INNER_LIPS = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95];
+    const _briBuf = new Float32Array(64 * 64);   // 内側画素の明度(相対特徴を二周目で作るため)
+    const _satBuf = new Float32Array(64 * 64);   // 同 彩度
+    const _tCanvas = document.createElement('canvas');
+    _tCanvas.width = _tCanvas.height = 64;                       // 64x64で十分(口だけを切り出すので)
+    const _tCtx = _tCanvas.getContext('2d', { willReadFrequently: true });
+    // ?diag=1 の時だけ、切り出しの実物を1秒に1枚だけ送る。**数字で当て物をせず目で見るための口**。
+    // 左=生の切り出し / 右=実際に数えている画素だけ(ポリゴン外は黒)。並べれば「どこを測っているか」が一目で分かる。
+    const DIAG = new URLSearchParams(location.search).has('diag');
+    // 「測っている最中」= ?diag=1 か、**校正ボタンで収集中の1.5秒**。
+    // 校正中も門番を素通りさせるのが肝: 門番自体が正しいかを疑っている以上、
+    // 門番に殺されたフレームを測れないと**門番の誤りは永久に見えない**。
+    const measuring = () => DIAG || state.calPhase !== 0;
+    const _dCanvas = document.createElement('canvas');
+    _dCanvas.width = 512; _dCanvas.height = 256;                  // 4倍に拡大して送る(64x64では目視できない)
+    const _dCtx = _dCanvas.getContext('2d');
+    _dCtx.imageSmoothingEnabled = false;
+    const _mCanvas = document.createElement('canvas');            // マスク済みを一旦置く場所
+    _mCanvas.width = _mCanvas.height = 64;
+    const _mCtx = _mCanvas.getContext('2d');
+    let _lastCrop = 0;
+    function pointInPoly(x, y, poly) {                            // 交差数判定(レイキャスト)
+      let inside = false;
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const [xi, yi] = poly[i], [xj, yj] = poly[j];
+        if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+      }
+      return inside;
+    }
+    function computeTongue(result) {
+      const lm = result.faceLandmarks && result.faceLandmarks[0];
+      const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+      state.tongueRaw = 0;
+      state.tFeatOk = false;   // 早期returnすると state.tFeat は前フレームの値のまま残る。
+                               // 診断側がそれを新しい観測と誤認しないよう、鮮度を明示して送る。
+      if (!lm || !vw || !vh) return 0;
+      const pts = INNER_LIPS.map((i) => [lm[i].x * vw, lm[i].y * vh]);
+      let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+      for (const [x, y] of pts) {
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+      }
+      const w = maxX - minX, h = maxY - minY;
+      // 実ピクセルでの下限。**引き伸ばした後の画素数で判定してはいけない**:
+      // 開口部が何ピクセルだろうと 64x64 に拡大するので、下の `inside` は口の大小を反映しない。
+      if (w < 12 || h < 4) return 0;                              // 口が小さすぎ(遠い/横向き)
+      state.mouthOpen = h / w;                                    // 唇の隙間の縦横比＝開き具合
+      // 測定中(?diag=1 または校正中)は門番で打ち切らない。**弾かれた時の値こそ見たい**ので最後まで計算する。
+      if (!measuring() && state.mouthOpen < CFG.TONGUE_MIN_OPEN) return 0;   // 完全に閉じている
+      const N = 64;
+      _tCtx.drawImage(videoEl, minX, minY, w, h, 0, 0, N, N);     // 口の開口部だけを切り出して拡大
+      const d = _tCtx.getImageData(0, 0, N, N).data;
+      const rawPoly = pts.map(([x, y]) => [((x - minX) / w) * N, ((y - minY) / h) * N]);
+      let poly = rawPoly;
+      // ★ポリゴンを重心へ向けて縮める(収縮)。**これが無いと「う」の口で必ず誤検出する**:
+      //   すぼめると開口部が細くなり、内側と判定される画素のほとんどが**唇そのものの縁**になる。
+      //   唇は「赤い・明るい・鮮やか」を全部満たすので、舌が無くても比率が 1 に張り付く。
+      //   引き伸ばし後の空間で縮めるので、縦横の比率が違っても均等に効く。
+      {
+        let cx = 0, cy = 0;
+        for (const [x, y] of poly) { cx += x; cy += y; }
+        cx /= poly.length; cy /= poly.length;
+        poly = poly.map(([x, y]) => [cx + (x - cx) * CFG.TONGUE_SHRINK, cy + (y - cy) * CFG.TONGUE_SHRINK]);
+      }
+      let inside = 0, tongue = 0;
+      let dark = 0, teeth = 0, redLo = 0, redLoBot = 0, sB = 0, sS = 0, sR = 0, bottom = 0;
+      for (let py = 0; py < N; py++) {
+        for (let px = 0; px < N; px++) {
+          if (!pointInPoly(px + 0.5, py + 0.5, poly)) continue;   // ★唇を含めない
+          inside++;
+          if (py > N / 2) bottom++;
+          const o = (py * N + px) * 4;
+          const R = d[o], G = d[o + 1], B = d[o + 2], sum = R + G + B + 1;
+          const mx = R > G ? (R > B ? R : B) : (G > B ? G : B);
+          const mn = R < G ? (R < B ? R : B) : (G < B ? G : B);
+          const sat = mx > 0 ? (mx - mn) / mx : 0;
+          const bri = sum / 765, red = R / sum;
+          _briBuf[inside - 1] = bri; _satBuf[inside - 1] = sat;   // 二周目(相対特徴)用に控える
+          if (red > CFG.TONGUE_R && bri > CFG.TONGUE_L && sat > CFG.TONGUE_S) tongue++;
+          // --- 特徴量の候補を同時に数える(どれが舌を分離できるかを実測で選ぶための診断) ---
+          if (bri < 0.20) dark++;                                  // 奥の口腔=暗い
+          else if (bri > 0.35 && sat < 0.25) teeth++;              // 歯=明るく白い
+          if (sat > 0.25 && red > 0.38 && bri > 0.08) redLo++;     // 明度の下限を大きく下げた「赤い」
+          if (py > N / 2 && sat > 0.25 && red > 0.38 && bri > 0.08) redLoBot++;   // 下半分だけ(出た舌は下に乗る)
+          sB += bri; sS += sat; sR += red;
+        }
+      }
+      if (!measuring() && inside < CFG.TONGUE_MIN_AREA) return 0;   // 開口部の実面積が足りない=測っても唇しか見えない
+      if (inside < 16) return 0;                            // 0除算だけは避ける
+      state.tongueStats = { inside, tongue, w: Math.round(w), h: Math.round(h), open: +state.mouthOpen.toFixed(3) };
+      state.tongueW = w; state.tongueH = h; state.tongueInside = inside;
+      // ★相対特徴。上の dark/teeth は明度の**絶対値**(<0.20 / >0.35)で数えているが、
+      //   その 0.20〜0.35 は実測3回の平均明度 0.18〜0.37 のちょうど真ん中に在る。
+      //   露出が少し動くだけで画素が閾値を跨ぎ、特徴量の意味が丸ごと入れ替わる:
+      //     20:30の回 舌の「歯」=0.561 / 21:05の回 舌の「歯」=0.000(同じ人・同じ日)
+      //   そこで**その口の中自身の平均**を基準に数え直す。照明が明暗どちらでも
+      //   「歯は周りより明るく白い」「奥は周りより暗い」という関係は変わらない。
+      const mb = sB / inside, ms = sS / inside;
+      let darkR = 0, teethR = 0, varB = 0;
+      for (let i = 0; i < inside; i++) {
+        const bi = _briBuf[i], dv = bi - mb;
+        varB += dv * dv;
+        if (bi < mb * CFG.TONGUE_DARK_REL) darkR++;                                        // 平均より暗い
+        else if (bi > mb * CFG.TONGUE_TEETH_REL && _satBuf[i] < ms * CFG.TONGUE_TEETH_SAT) teethR++;  // 平均より明るく白い
+      }
+      state.tFeat = {                                              // 0..1 の割合に正規化して送る
+        darkR: darkR / inside, teethR: teethR / inside,
+        // むら(変動係数)。**舌は開口部を一様な一枚の面で塞ぐ**ので小さくなるはず。
+        // 歯(明)と口腔(暗)が同居する口では大きくなる。明るさに依らない量なのが利点。
+        cv: mb > 1e-6 ? Math.sqrt(varB / inside) / mb : 0,
+        dark: dark / inside, teeth: teeth / inside,                // 絶対値版。診断として残す
+        redLo: redLo / inside, redLoBot: bottom ? redLoBot / bottom : 0,
+        b: sB / inside, s: sS / inside, r: sR / inside,
+      };
+      state.tFeatOk = true;
+      if (DIAG && performance.now() - _lastCrop > 1000) {   // 画の送出は ?diag=1 の時だけ(重いので)
+        _lastCrop = performance.now();
+        _dCtx.drawImage(_tCanvas, 0, 0, N, N, 0, 0, 256, 256);     // 左: 生の切り出し(4倍)
+        const img = _tCtx.getImageData(0, 0, N, N);
+        const q = img.data;
+        for (let py = 0; py < N; py++) {
+          for (let px = 0; px < N; px++) {
+            if (pointInPoly(px + 0.5, py + 0.5, poly)) continue;
+            const o = (py * N + px) * 4;
+            q[o] = q[o + 1] = q[o + 2] = 0;                         // 数えていない画素を黒で潰す
+          }
+        }
+        _mCtx.putImageData(img, 0, 0);
+        _dCtx.drawImage(_mCanvas, 0, 0, N, N, 256, 0, 256, 256);   // 右: 実際に数えている範囲(4倍)
+        // 左に輪郭を重ねる: 黄=landmark そのまま / 緑=収縮後(実際に数える境界)
+        const stroke = (pl, color) => {
+          _dCtx.beginPath();
+          pl.forEach(([x, y], i) => (i ? _dCtx.lineTo(x * 4, y * 4) : _dCtx.moveTo(x * 4, y * 4)));
+          _dCtx.closePath(); _dCtx.strokeStyle = color; _dCtx.lineWidth = 2; _dCtx.stroke();
+        };
+        stroke(rawPoly, '#ffe000');
+        stroke(poly, '#00ff40');
+        state.cropB64 = _dCanvas.toDataURL('image/png').split(',')[1];
+      }
+      state.tongueRaw = tongue / inside;   // 旧指標(赤い画素の割合)。判定には使わないが診断に残す
+      if (state.mouthOpen < CFG.TONGUE_MIN_OPEN || inside < CFG.TONGUE_MIN_AREA) return 0;   // 門番(診断中もここで殺す)
+      // 舌らしさ = 「歯が見えない」かつ「暗くない」。**弱い方を採る(min)**のが肝で、
+      // どちらか一方でも非舌の証拠が出ていれば舌ではない。
+      return tongueScore();
+    }
+
+    // 校正が選んだ1軸で舌らしさを出す。判定と HUD で同じ式を使うためここに置く。
+    // hi<lo の時は自然に降順として効く(差で割っているので符号がそのまま入る)。
+    const featVal = (k) => (k === 'raw' ? state.tongueRaw : (state.tFeat?.[k] ?? 0));
+    const tongueScore = () => {
+      const r = CFG.TONGUE_RULE;
+      return clamp01((featVal(r.key) - r.lo) / ((r.hi - r.lo) || 1e-6));
+    };
+
+    // ===== 目線計算 =====
+    function computeGaze() {
+      const get = (name) => state.blendshapeMap.get(name) ?? 0;
+      const pitch_L = (get('eyeLookDownLeft') - get('eyeLookUpLeft')) * CFG.GAZE_DEG;
+      const yaw_L   = (get('eyeLookOutLeft')  - get('eyeLookInLeft'))  * CFG.GAZE_DEG;
+      const pitch_R = (get('eyeLookDownRight') - get('eyeLookUpRight')) * CFG.GAZE_DEG;
+      const yaw_R   = (get('eyeLookInRight')   - get('eyeLookOutRight')) * CFG.GAZE_DEG;
+      return {
+        left: { pitch: pitch_L, yaw: yaw_L },
+        right: { pitch: pitch_R, yaw: yaw_R },
+      };
+    }
+
+    // ===== ブレンドシェイプ: ARKit 52個の品揃えで送る =====
+    // MediaPipe FaceLandmarker が返すカテゴリ名は **ARKit と同じ**。下は同梱モデル
+    // (vendor/face_landmarker.task) のカテゴリ表から機械的に抜いた実物で、MediaPipe 固有の
+    // `_neutral` を除いた 51 個。ARKit の 52 個目 `tongueOut` は MediaPipe が値を返さない
+    // (常に0)ので、ここには入れず自前推定(computeTongue)を後から足す。
+    const ARKIT_SHAPES = [
+      'browDownLeft', 'browDownRight', 'browInnerUp', 'browOuterUpLeft', 'browOuterUpRight', 'cheekPuff',
+      'cheekSquintLeft', 'cheekSquintRight', 'eyeBlinkLeft', 'eyeBlinkRight', 'eyeLookDownLeft', 'eyeLookDownRight',
+      'eyeLookInLeft', 'eyeLookInRight', 'eyeLookOutLeft', 'eyeLookOutRight', 'eyeLookUpLeft', 'eyeLookUpRight',
+      'eyeSquintLeft', 'eyeSquintRight', 'eyeWideLeft', 'eyeWideRight', 'jawForward', 'jawLeft',
+      'jawOpen', 'jawRight', 'mouthClose', 'mouthDimpleLeft', 'mouthDimpleRight', 'mouthFrownLeft',
+      'mouthFrownRight', 'mouthFunnel', 'mouthLeft', 'mouthLowerDownLeft', 'mouthLowerDownRight', 'mouthPressLeft',
+      'mouthPressRight', 'mouthPucker', 'mouthRight', 'mouthRollLower', 'mouthRollUpper', 'mouthShrugLower',
+      'mouthShrugUpper', 'mouthSmileLeft', 'mouthSmileRight', 'mouthStretchLeft', 'mouthStretchRight', 'mouthUpperUpLeft',
+      'mouthUpperUpRight', 'noseSneerLeft', 'noseSneerRight',
+    ];
+    // ARKit名 → iFacialMocap のキー名。iFM は camelCase のまま、左右だけ Left/Right を _L/_R に
+    // する(例: mouthSmileLeft → mouthSmile_L)。この規則は renderer 側の既存パーサと
+    // meowJsonToIFM が実物の iFM に対して使っている名前と一致する。
+    // ★例外4つ: jawLeft/jawRight/mouthLeft/mouthRight は「左右の対」ではなく
+    //   **顎/口を左右に寄せる方向のシェイプ**で、ARKit 側にも _L/_R の概念が無い。
+    //   機械変換すると jaw_L / mouth_L という存在しない名前に化けるので素通しする。
+    //   (本物の iFM のキャプチャと突き合わせて確定した訳ではない。実機テストの確認項目)
+    const IFM_NAME_VERBATIM = new Set(['jawLeft', 'jawRight', 'mouthLeft', 'mouthRight']);
+    function toIFMName(mp) {
+      if (IFM_NAME_VERBATIM.has(mp)) return mp;
+      if (mp.endsWith('Left')) return mp.slice(0, -4) + '_L';
+      if (mp.endsWith('Right')) return mp.slice(0, -5) + '_R';
+      return mp;
+    }
+    // 同梱モデルを差し替えた時に、こちらの表から漏れたカテゴリを黙って捨てないための番人。
+    // (起動後の最初の検出で1回だけ照合する)
+    let shapesChecked = false;
+    function checkShapeCoverage() {
+      if (shapesChecked || !state.blendshapeMap.size) return;
+      shapesChecked = true;
+      const known = new Set(ARKIT_SHAPES);
+      const extra = [...state.blendshapeMap.keys()].filter((k) => k !== '_neutral' && !known.has(k));
+      const missing = ARKIT_SHAPES.filter((k) => !state.blendshapeMap.has(k));
+      if (extra.length) console.warn('[shapes] 表に無いカテゴリを送っていない:', extra);
+      if (missing.length) console.warn('[shapes] モデルが返さないカテゴリ(0で送る):', missing);
+      console.log(`[shapes] ARKit ${ARKIT_SHAPES.length + 1}個で送信中 (モデル ${state.blendshapeMap.size}個)`);
+    }
+
+    // ===== メッセージ生成 =====
+    function buildMessage(head, gaze) {
+      const get = (name) => state.blendshapeMap.get(name) ?? 0;
+      const v = (val) => (val * 100).toFixed(3); // 0..1 → 0..100
+      const parts = [
+        // 51個を必ず全部並べる(モデルが返さない物は 0)。askr は数個しか読まないが、
+        // iFacialMocap 互換の他の受信ソフトは残りも使うため、品揃えを削らない。
+        ...ARKIT_SHAPES.map((n) => `${toIFMName(n)}-${v(get(n))}`),
+        `tongueOut-${(state.tongue * 100).toFixed(1)}`,   // ← MediaPipeの値ではなく自前推定(上のcomputeTongue)
+        // --- ここから下は測定中(?diag=1 または校正の1.5秒)だけ付く仮設の口。閾値を「他人の写真」では
+        //     なく**実機の実測**で決めるための診断。`=tdbg#`+`=tfeat#` は毎フレーム約90バイト＝
+        //     18fpsで 1.6KB/s を全受信者に配り続ける物なので、iFacialMocap 互換を名乗る以上、
+        //     平常時の経路には混ぜない。**校正中だけは載せる**のが要点で、これにより
+        //     URLに ?diag=1 を打たなくても「校正ボタンを2回押す」だけでラベル付きの実測が採れる
+        //     (押している間の約54フレームぶんしか出ない)。
+        ...(measuring() ? [
+          // 末尾2つ: 校正の相(0=平常 1=①舌なし 2=②舌あり) と tFeat の鮮度。
+          //   **相そのものが正解ラベル**。「いつ舌を出していたか」を後から思い出す必要をなくす。
+          `=tdbg#${state.tongueRaw.toFixed(4)},${state.mouthOpen.toFixed(3)},${(state.tongueW || 0).toFixed(0)},${(state.tongueH || 0).toFixed(0)},${state.tongueInside || 0},${state.calPhase},${state.tFeatOk ? 1 : 0}`,
+          `=tfeat#${['darkR', 'teethR', 'cv', 'dark', 'teeth', 'redLo', 'redLoBot', 'b', 's', 'r'].map((k) => ((state.tFeat && state.tFeat[k]) || 0).toFixed(4)).join(',')}`,
+        ] : []),
+        ...(state.cropB64 ? [`=tcrop#${(() => { const b = state.cropB64; state.cropB64 = null; return b; })()}`] : []),
+        // 校正の結果。押してから10分間だけ載る。並びは CAL_KEYS の順で「①舌なし/②舌あり」。
+        // **これがあるので、押す瞬間にPC側が聞いている必要が無い**(後から繋いで読めばよい)。
+        ...(state.calResult && performance.now() < state.calResultUntil
+          ? [`=tcal#${state.calResult}`] : []),
+        `=head#${head.euler.x.toFixed(3)},${head.euler.y.toFixed(3)},${head.euler.z.toFixed(3)},${head.pos.x.toFixed(3)},${head.pos.y.toFixed(3)},${head.pos.z.toFixed(3)}`,
+        `=headq#${head.quat.x.toFixed(5)},${head.quat.y.toFixed(5)},${head.quat.z.toFixed(5)},${head.quat.w.toFixed(5)}`,  // 四元数だけ5桁: 3桁だと角度分解能が0.1°級で首がカクつく
+        `leftEye#${gaze.left.pitch.toFixed(3)},${gaze.left.yaw.toFixed(3)}`,
+        `rightEye#${gaze.right.pitch.toFixed(3)},${gaze.right.yaw.toFixed(3)}`,
+      ];
+      return parts.join('|');
+    }
+
+    // ===== HUD 更新 =====
+    function updateHUD(head, gaze) {
+      const e = head.euler;
+      const p = head.pos;
+      const blinkL = (state.blendshapeMap.get('eyeBlinkLeft') ?? 0) * 100;
+      const blinkR = (state.blendshapeMap.get('eyeBlinkRight') ?? 0) * 100;
+      const jaw = (state.blendshapeMap.get('jawOpen') ?? 0) * 100;
+      hudContent.textContent =
+        `yaw: ${e.y.toFixed(1)}°  pitch: ${e.x.toFixed(1)}°  roll: ${e.z.toFixed(1)}°\n` +
+        `blink L: ${blinkL.toFixed(1)}  R: ${blinkR.toFixed(1)}\n` +
+        // 舌の判定は端末の画面だけで追えるようにする。**PC側から覗くには本人が端末の前を
+        // 離れる必要があり、その瞬間に送信が止まる**ので、覗き窓は端末側に無いと役に立たない。
+        // 歯/暗 の後ろの[]は、その軸だけで見た舌らしさ(0..1)。小さい方が最終値になる。
+        `jawOpen: ${jaw.toFixed(1)}   舌: ${(state.tongue * 100).toFixed(0)}   開 ${state.mouthOpen.toFixed(2)} 面 ${state.tongueInside || 0}\n` +
+        `  判定軸 ${CFG.TONGUE_RULE.key}=${featVal(CFG.TONGUE_RULE.key).toFixed(3)} ` +
+          `(舌なし ${CFG.TONGUE_RULE.lo.toFixed(3)} → 舌 ${CFG.TONGUE_RULE.hi.toFixed(3)})\n` +
+        `pos(m): ${p.x.toFixed(3)}, ${p.y.toFixed(3)}, ${p.z.toFixed(3)}\n` +
+        `gaze L: ${gaze.left.pitch.toFixed(1)}, ${gaze.left.yaw.toFixed(1)}  R: ${gaze.right.pitch.toFixed(1)}, ${gaze.right.yaw.toFixed(1)}`;
+    }
+
+    // ===== デバッグ用 =====
+    window.tracker = {
+      zero() {
+        state.neutralQuat = null;
+        state.lastQrel = null;
+      },
+      setSendHz(n) {
+        CFG.SEND_HZ = n;
+      },
+      cam180(on = !CFG.CAM_FACING_180) {
+        CFG.CAM_FACING_180 = on;
+        try { localStorage.setItem('askr_cam180', on ? '1' : '0'); } catch (e) {}
+        console.log('[tracker] カメラ正対補正:', on ? 'ON' : 'OFF');
+      },
+      state,
+      // しきい値を詰めるための覗き窓: 実際に見ている口の切り出しと内訳を返す
+      roi: () => ({ url: _tCanvas.toDataURL(), stats: state.tongueStats,
+                    cfg: CFG.TONGUE_RULE }),
+    };
+
+    // ===== 起動 =====
+    init();
+  </script>
+</body>
+</html>

@@ -7,3 +7,7 @@ renderer/assets/*.vrm
 !renderer/assets/model.vrm
 *.bak*
 leap_capture.txt
+
+# 自作ブラウザ版トラッカーの同梱物(fetch_vendor.sh で取り直せる 26MB)と自己署名証明書
+renderer/tracker/vendor/
+renderer/tracker/certs/
