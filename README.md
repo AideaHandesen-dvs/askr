@@ -64,10 +64,11 @@
 cd renderer
 python3 -m venv .venv && . .venv/bin/activate
 pip install websockets python-osc          # python-osc は VMC 中継を使う場合のみ
-# サンプル VRM 同梱済み（assets/model.vrm・舌焼き込み済みで clone してそのまま舌も動く）
+# サンプル VRM 同梱済み（assets/model.vrm・舌と頬ふくらましを焼き込み済みで clone してそのまま動く）
 # 自分の VRoid 等に差し替えるなら:
 #   cp /path/to/your.vrm assets/model.vrm    # または URL の ?vrm=... で指定
 #   自分のモデルに舌を足すなら: python tools/vrm_add_tongue.py in.vrm out.vrm
+#   頬ふくらましを足すなら:     python tools/vrm_add_cheekpuff.py in.vrm out.vrm
 python config_server.py                      # :8199
 python raw_ifm_ws_bridge.py                  # :8201  (顔を使うなら)
 python leap_raw_ws_bridge.py                 # :8202  (手を使うなら)
@@ -154,6 +155,27 @@ MediaPipe が `tongueOut` を返さない（舌を出した写真で測っても
 
 **照明や端末の置き方が変わったら押し直す**（選ばれる軸がその場の写り方に依存するため）。
 
+### 頬ふくらまし（cheekPuff）
+
+renderer は morph 名に `cheekpuff` を含むモーフを見つけると自動で expression `cheekpuff` に繋ぐ。
+同梱の `renderer/assets/model.vrm` は頬を焼き込み済みなので、そのまま動く。
+VRoid 系 VRM は**頬をふくらませる表情を持たない**ので、付属ツールで焼き込む：
+
+```bash
+python tools/vrm_add_cheekpuff.py your_avatar.vrm your_avatar_cheek.vrm
+# ※ numpy が要る。vrm_add_tongue.py と同じ場所に置いて使う（読み書きの下回りを共用）
+# ※ 新しい頂点は作らず、顔の肌の頂点（口の左右・少し上）を外側へ押し出すモーフを足すだけ
+# ※ 既に CheekPuff を持つモデル（同梱 model.vrm など）を与えると二重焼き込み防止で中止する
+# ※ 舌と頬はどちらの順で焼いてもよい
+```
+
+頬の値は **iPhone の ARKit（`cheekPuff`）だけ**が出す。ブラウザ版トラッカーは MediaPipe が `cheekPuff` を
+**常に 0** で返すため、頬は動かない（同じく `cheekSquint_L/R`・`noseSneer_L/R` も 0）。
+
+ARKit の `cheekPuff` は思い切り膨らませても **30〜60 程度で、100 までは出ない**（実測）。そのため renderer は
+パネルの「**頬 全開値**」（既定 35）で割って全開にする。膨らみが小さければ全開値を下げるか「**頬 強さ**」を上げ、
+思い切り膨らませた時に顔が張り出しすぎるなら「頬 強さ」を下げる。
+
 ## OBS（ブラウザソースで直接取り込む）
 
 - OBS の**ブラウザソース**に `http://<レンダーホスト>:8199/?clean=1` を指定
@@ -165,8 +187,9 @@ MediaPipe が `tongueOut` を返さない（舌を出した写真で測っても
 
 ## 操作
 
-- 全調整は**右上のパネル**（目線・表情・舌・体駆動・Leap の腕/手/指・カメラ・背景）。変更は `config.json` に保存
+- 全調整は**右上のパネル**（目線・表情・舌・頬・体駆動・Leap の腕/手/指・カメラ・背景）。変更は `config.json` に保存
   - **舌**：tongueOut（iFacialMocap／ブラウザ版トラッカーの自前推定）で駆動。パネルで ON/OFF・強さ・色を調整（OFF で舌メッシュを完全非表示）
+  - **頬**：cheekPuff（iFacialMocap のみ）で駆動。パネルで ON/OFF・強さ・全開値を調整
 - **キー 1–4**：カメラ視点スロットの呼び出し（パネルで保存、起動時はスロット 1 を復元＝URL の `?cam=N` で変更可）
 - **Space**：診断表示（HUD/ドット）のトグル
 

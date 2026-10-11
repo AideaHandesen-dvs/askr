@@ -9,7 +9,8 @@ model is NOT MIT).
 
 This bundled build additionally includes a tongue mesh + `Tongue` morph
 baked in by the author (tools/vrm_add_tongue.py) so iFacialMocap tongueOut
-drives the tongue out of the box.
+drives the tongue out of the box, and a `CheekPuff` morph on the face
+(tools/vrm_add_cheekpuff.py) so iFacialMocap cheekPuff puffs the cheeks.
 
 Terms (from the model's embedded VRM license metadata):
 
