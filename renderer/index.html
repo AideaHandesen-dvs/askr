@@ -82,7 +82,7 @@ const TURN_GAIN = 0.3, TURN_MAX = 0.2;  // 頭傾げ(roll)→胴ヨー[rad]。�
 //   目線ゲインは眼球±15°→白目回避で圧縮。実機で合わせた値はブラウザに残りリロードで復活する。
 const CFG_DEFAULTS = {
   eyePitchGain: 0.2, eyeYawGain: 0.4, eyePitchSign: 1, eyeYawSign: 1,
-  smileClip: 'fun', smileMouth: false, smileWidth: 1.3, smileGain: 1.0, mouthGain: 1.3, mouthThresh: 0.2, tongueEnable: true, tongueGain: 1.0, tongueColor: '#e0607a',
+  smileClip: 'fun', smileMouth: false, smileWidth: 1.3, smileGain: 1.0, mouthGain: 1.3, mouthThresh: 0.2, tongueEnable: true, tongueGain: 1.0, tongueColor: '#e0607a', cheekEnable: true, cheekGain: 2.0, cheekInMax: 35,
   // 体駆動(旧キー操作を設定化)：うっかりキー押下で変わらないよう全部パネル/保存に集約
   mirror: true,   // 左右ミラー(鏡モード)。データ側で動きだけ鏡映＝メッシュ(アホ毛/非対称)は反転しない
   bodyDrive: true, ikEnabled: true, gainMul: 1.0, signX: 1, signY: 1, signT: -1, colliderR: 0.09,
@@ -171,6 +171,9 @@ const PANEL = [
   { k: 'tongueEnable', label: '舌 ON',    type: 'bool' },
   { k: 'tongueGain',   label: '舌 強さ',   type: 'range', min: 0, max: 2, step: 0.1 },
   { k: 'tongueColor',  label: '舌 色',    type: 'color' },
+  { k: 'cheekEnable',  label: '頬 ON',    type: 'bool' },
+  { k: 'cheekGain',    label: '頬 強さ',   type: 'range', min: 0, max: 2, step: 0.1 },
+  { k: 'cheekInMax',   label: '頬 全開値', type: 'range', min: 10, max: 100, step: 5 },
   { sep: '体・首' },
   { k: 'mirror',       label: '左右ミラー', type: 'bool' },
   { k: 'bodyDrive',    label: '体駆動',    type: 'bool' },
@@ -401,6 +404,7 @@ const EXPR_ALIAS = {
   blink: ['blink'], blink_l: ['blinkleft', 'blink_l'], blink_r: ['blinkright', 'blink_r'],
   a: ['aa', 'a'], i: ['ih', 'i'], u: ['ou', 'u'], e: ['ee', 'e'], o: ['oh', 'o'],
   tongueout: ['tongueout', 'tongue'],
+  cheekpuff: ['cheekpuff'],
 };
 const exprMap = new Map();   // lowercased -> 実名
 function resolveExpr(vmcName) {
@@ -416,6 +420,7 @@ let SMILE_FACE_EXPRS = [];        // 笑顔face(目+眉)exprの実名一覧。�
 const smileMouthBinds = [];       // 笑顔の口(Fcl_MTH_Fun)のbind。口角幅を CFG.smileWidth でライブ調整する
 const mouthOpenBinds = [];        // 口開き(Fcl_MTH_A=顎)のbind。開き具合を CFG.mouthGain でライブ調整(1.0超で誇張)
 const tongueBinds = [];           // 舌出し(Tongueモーフ)のbind。強さを CFG.tongueGain でライブ調整
+const cheekBinds = [];            // 頬ふくらまし(CheekPuffモーフ)のbind。強さを CFG.cheekGain でライブ調整
 const loader = new GLTFLoader();
 loader.register((parser) => new VRMLoaderPlugin(parser));
 
@@ -522,6 +527,17 @@ loader.load(
         registerExpr('tongueout', (e) => addMorphBinds(e, tongueMorph, CFG.tongueGain, tongueBinds));
         if (window._tongueMat && window._tongueMat.color) window._tongueMat.color.set(CFG.tongueColor);   // 保存色を即反映
         console.log(`[tongue] 舌morph発見: ${tongueMorph} → expression 'tongueout' 登録`);
+      }
+      // 頬ふくらまし(cheekPuff)。VRoid は頬のmorphを持たない＝tools/vrm_add_cheekpuff.py で焼いた 'CheekPuff' を拾う。
+      //   無ければ何もしない(舌と同じ方針)。
+      let cheekMorph = null;
+      vrm.scene.traverse((o) => {
+        if (cheekMorph || !o.isMesh || !o.morphTargetDictionary) return;
+        for (const key in o.morphTargetDictionary) if (/cheek_?puff/i.test(key)) { cheekMorph = key; break; }
+      });
+      if (cheekMorph) {
+        registerExpr('cheekpuff', (e) => addMorphBinds(e, cheekMorph, CFG.cheekGain, cheekBinds));
+        console.log(`[cheek] 頬morph発見: ${cheekMorph} → expression 'cheekpuff' 登録`);
       }
       // 笑顔face実名(重複除去)。複合(fun/joy)は VRM0→1 で relaxed/happy 等に化けるため resolveExpr で解決
       SMILE_FACE_EXPRS = [resolveExpr('fun'), resolveExpr('joy'),
@@ -678,6 +694,8 @@ function processRawIFM(text) {
   const jo = ifmVal(text, 'jawOpen') / 100;
   blendVal.set('A', clamp01((jo - CFG.mouthThresh) / Math.max(0.01, 1 - CFG.mouthThresh)));
   blendVal.set('TongueOut', clamp01(ifmVal(text, 'tongueOut') / 100));   // 舌出し(ARKit tongueOut)
+  // 頬ふくらまし(ARKit cheekPuff)。実測で思い切り膨らませても 30〜60 止まり(100 まで出ない)＝cheekInMax で全開にする
+  blendVal.set('CheekPuff', clamp01(ifmVal(text, 'cheekPuff') / Math.max(1, CFG.cheekInMax || 100)));
   // 頭(rot deg + pos)
   const h = ifmVec(text, '=head#');
   if (h && h.length >= 6) {
@@ -1226,11 +1244,18 @@ function animate() {
         for (const b of tongueBinds) b.weight = CFG.tongueGain;
         em.setValue(tongueExpr, CFG.tongueEnable ? (blendVal.get('TongueOut') || 0) : 0);   // OFFで強制的に引っ込む
       }
+      // 頬ふくらまし(cheekPuff)。舌と同じ作り。'CheekPuff' は下でスキップ
+      const cheekExpr = exprMap.get('cheekpuff');
+      if (cheekExpr) {
+        for (const b of cheekBinds) b.weight = CFG.cheekGain;
+        em.setValue(cheekExpr, CFG.cheekEnable ? (blendVal.get('CheekPuff') || 0) : 0);
+      }
       // 瞬き/ウィンクはフル、Angry/Surprisedは口が開いたら抑制(笑顔Fun・口開きAは上で処理済み)
       for (const [n, v] of blendVal) {
         if (n === 'Fun') continue;
         if (n === 'A' && openExpr) continue;   // mouthopenで駆動済み(openExpr無い時だけ既定'aa'にフォールバック)
         if (n === 'TongueOut' && tongueExpr) continue;   // tongueoutで駆動済み
+        if (n === 'CheekPuff') continue;                 // cheekpuffで駆動済み(頬morph無しのVRMでは何もしない)
         const nm = SWAP[n] || n;
         const a = resolveExpr(nm); if (!a) continue;
         em.setValue(a, EMO.has(n) ? v * suppress : v);
